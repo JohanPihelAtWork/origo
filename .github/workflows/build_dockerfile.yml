@@ -27,7 +27,7 @@ jobs:
         run: |
           USERNAME=$(echo ${{ github.actor }} | tr '[:upper:]' '[:lower:]')
           IMAGE_TAG=${{ github.ref_name }}
-          docker build -t ghcr.io/johanpihelatwork/origo:$IMAGE_TAG -f Dockerfile .
+          docker build -t ghcr.io/$USERNAME/origo:$IMAGE_TAG -f Dockerfile .
 
       - name: Push Docker image to GHCR
-        run: docker push ghcr.io/johanpihelatwork/origo:$IMAGE_TAG
+        run: docker push ghcr.io/$USERNAME/origo:$IMAGE_TAG
