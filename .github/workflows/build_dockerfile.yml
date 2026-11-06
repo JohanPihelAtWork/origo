@@ -4,6 +4,11 @@ on:
   push:
     branches: [ 'pr-*', 'main', 'master' ]
 
+# GITHUB_TOKEN behöver skrivbehörighet för att pusha till GHCR
+permissions:
+  contents: read
+  packages: write
+
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
@@ -11,7 +16,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # För att få tillgång till alla historik
+          fetch-depth: 0  # För att få tillgång till all historik
 
       - name: Logga in till GHCR
         uses: docker/login-action@v3
@@ -21,11 +26,15 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Bygg Docker-bild
+        env:
+          IMAGE_TAG: ${{ github.ref_name }}
         run: |
-          IMAGE_TAG=${{ github.ref_name }}
-          docker build -t ghcr.io/johanpihelatwork/origo:$IMAGE_TAG -f Dockerfile .
+          # GHCR kräver gemener och tags får inte innehålla "/"
+          SAFE_TAG=$(echo "$IMAGE_TAG" | tr '[:upper:]' '[:lower:]' | sed 's|/|-|g')
+          echo "Bygger bild med tag: $SAFE_TAG"
+          docker build -t ghcr.io/johanpihelatwork/origo:$SAFE_TAG -f Dockerfile .
+          echo "SAFE_TAG=$SAFE_TAG" >> "$GITHUB_ENV"
 
       - name: Push Docker-bild till GHCR
         run: |
-          IMAGE_TAG=${{ github.ref_name }}
-          docker push ghcr.io/johanpihelatwork/origo:$IMAGE_TAG
+          docker push ghcr.io/johanpihelatwork/origo:${{ env.SAFE_TAG }}
