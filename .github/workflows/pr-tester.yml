@@ -115,38 +115,25 @@ jobs:
       - name: Create Dockerfile for ORIGO
         run: |
           cat > Dockerfile.pr << 'DOCKERFILE'
-          # ────────────────────────────────────────────
-          # Stage 1: Build (kastas efteråt, ej i slutimagen)
-          # ────────────────────────────────────────────
           FROM node:lts-alpine AS builder
 
           WORKDIR /app
 
-          # Kopiera dependency-manifest FÖRST — då kan Docker
-          # cache:a npm-lagret separat från källkoden, och
-          # om endast källkod ändras installeras inget om.
           COPY package.json package-lock.json ./
-
-          # Installera ALLA beroenden (även devDependencies —
-          # browserify/uglifyjs behövs för att bygga).
           RUN npm ci
 
-          # Kopiera resten av källkoden
           COPY . .
 
-          # Bygg bundle.js + index.html (produktion)
           RUN NODE_ENV=production npm run build
-          # DEBUG: visa var byggprodukterna hamnade
+
           # 🔍 DEBUG: Visa exakt var byggfiler hamnade
           RUN echo "=== Söker efter bundle.js ===" \
-          && find /app -name "bundle.js" 2>/dev/null || true \
-          && echo "=== Söker efter index.html ===" \
-          && find /app -name "index.html" 2>/dev/null || true \
-          && echo "=== Rotkatalogens innehåll ===" \
-          && ls -la /app
-          # Samla byggprodukter i /out.
-          # Shell-syntax här TillåTS (RUN körs av sh) till skillnad
-          # från COPY, som inte hanterar "2>/dev/null || true".
+              && find /app -name "bundle.js" 2>/dev/null || true \
+              && echo "=== Söker efter index.html ===" \
+              && find /app -name "index.html" 2>/dev/null || true \
+              && echo "=== Rotkatalogens innehåll ===" \
+              && ls -la /app
+
           RUN mkdir -p /out \
                && cp bundle.js index.html /out/ \
                && (cp -r css img fonts /out/ 2>/dev/null || true) \
@@ -155,18 +142,9 @@ jobs:
                && test -f /out/bundle.js \
                || (echo "ERROR: bundle.js saknas efter build" && exit 1)
 
-          # ────────────────────────────────────────────
-          # Stage 2: Runtime (nginx, ~20 MB)
-          # ────────────────────────────────────────────
           FROM nginx:alpine AS production
-
-          # Enda kopieringen som behövs — allt från /out
           COPY --from=builder /out/ /usr/share/nginx/html/
-
-          # Standard-HTTP-port
           EXPOSE 80
-
-          # Kör nginx i förgrunden (krävs av Docker)
           CMD ["nginx", "-g", "daemon off;"]
           DOCKERFILE
 
