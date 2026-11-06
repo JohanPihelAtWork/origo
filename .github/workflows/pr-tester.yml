@@ -218,4 +218,4 @@ jobs:
 
           Därefter: http://localhost:8080
           EOF
-          echo "✓ Build summary uploaded"
+          echo "✓ Byggsammanfattning uppladdad!"
