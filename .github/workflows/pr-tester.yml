@@ -136,7 +136,10 @@ jobs:
 
           # Bygg bundle.js + index.html (produktion)
           RUN NODE_ENV=production npm run build
-
+          # DEBUG: visa var byggprodukterna hamnade
+          RUN find /app -maxdepth 3 -name "bundle.js" -o -maxdepth 3 -name "index.html" | head -20 \
+          && echo "--- rotkatalogen ---" \
+          && ls -la /app
           # Samla byggprodukter i /out.
           # Shell-syntax här TillåTS (RUN körs av sh) till skillnad
           # från COPY, som inte hanterar "2>/dev/null || true".
