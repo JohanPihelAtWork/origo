@@ -18,12 +18,24 @@ jobs:
         with:
           fetch-depth: 0  # För att få tillgång till all historik
 
-      # Felsökning: visa vad som faktiskt ligger i repot efter checkout
-      - name: Verifiera Dockerfile
+      - name: Skapa Dockerfile
         run: |
-          pwd
-          ls -la
-          ls -la Dockerfile || echo "INGEN Dockerfile i roten!"
+          cat > Dockerfile <<'EOF'
+          # Bygg klienten
+          FROM node:20-alpine AS build
+          WORKDIR /app
+          COPY package.json package-lock.json ./
+          RUN npm ci
+          COPY . .
+          RUN npm run build
+
+          # Serva byggresultatet
+          FROM nginx:alpine
+          COPY --from=build /app/dist /usr/share/nginx/html
+          EXPOSE 80
+          EOF
+          echo "---- Dockerfile skapad: ----"
+          cat Dockerfile
 
       - name: Logga in till GHCR
         uses: docker/login-action@v3
@@ -35,7 +47,6 @@ jobs:
       - name: Bygg Docker-bild
         env:
           IMAGE_TAG: ${{ github.ref_name }}
-          # Ändra denna sökväg om Dockerfilen ligger i en underkatalog:
           DOCKERFILE_PATH: ./Dockerfile
         run: |
           # GHCR kräver gemener och tags får inte innehålla "/"
