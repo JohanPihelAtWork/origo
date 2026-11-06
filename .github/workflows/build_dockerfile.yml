@@ -30,12 +30,10 @@ jobs:
           RUN npm run build
 
           # Serva byggresultatet
+          # OBS: origos webpack.copy.js lägger allt (inkl. index.html) i build/
           FROM nginx:alpine
-          # Ta bort nginx välkomstsida
           RUN rm -rf /usr/share/nginx/html/*
-          COPY --from=build /app/dist /usr/share/nginx/html
-          # index.html ligger i repots rot, inte i dist/
-          COPY --from=build /app/index.html /usr/share/nginx/html/index.html
+          COPY --from=build /app/build/ /usr/share/nginx/html/
           EXPOSE 80
           EOF
           echo "---- Dockerfile skapad: ----"
@@ -57,6 +55,8 @@ jobs:
           SAFE_TAG=$(echo "$IMAGE_TAG" | tr '[:upper:]' '[:lower:]' | sed 's|/|-|g')
           echo "Bygger bild med tag: $SAFE_TAG"
           docker build -t ghcr.io/johanpihelatwork/origo:$SAFE_TAG -f "$DOCKERFILE_PATH" .
+          # Verifiera att det som ska finnas faktiskt finns
+          docker run --rm ghcr.io/johanpihelatwork/origo:$SAFE_TAG ls /usr/share/nginx/html
           echo "SAFE_TAG=$SAFE_TAG" >> "$GITHUB_ENV"
 
       - name: Push Docker-bild till GHCR
