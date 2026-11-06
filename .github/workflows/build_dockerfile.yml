@@ -1,34 +1,31 @@
-name: Build and Push PR Docker Image
+name: Build and Push Docker Image
 
 on:
   push:
-    branches: [ 'pr-*', 'main', 'master' ]  # Triggers workflow för alla grenar som börjar med "pr-" eller huvudgrenar
+    branches: [ 'pr-*', 'main', 'master' ]
 
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # Fetcher full commit history for proper tagging
+          fetch-depth: 0  # För att få tillgång till alla historik
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Login to GHCR
+      - name: Logga in till GHCR
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build Docker image
+      - name: Bygg Docker-bild
         run: |
-          USERNAME=$(echo ${{ github.actor }} | tr '[:upper:]' '[:lower:]')
           IMAGE_TAG=${{ github.ref_name }}
-          echo "USERNAME is set to: $USERNAME"
-          docker build -t ghcr.io/$USERNAME/origo:$IMAGE_TAG -f Dockerfile .
+          docker build -t ghcr.io/johanpihelatwork/origo:$IMAGE_TAG -f Dockerfile .
 
-      - name: Push Docker image to GHCR
-        run: docker push ghcr.io/$USERNAME/origo:$IMAGE_TAG
+      - name: Push Docker-bild till GHCR
+        run: |
+          IMAGE_TAG=${{ github.ref_name }}
+          docker push ghcr.io/johanpihelatwork/origo:$IMAGE_TAG
