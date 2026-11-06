@@ -8,7 +8,7 @@ import getFeature from '../getfeature';
 import mapUtils from '../maputils';
 import popup from '../popup';
 import utils from '../utils';
-import Infowindow from '../components/infowindow';
+import FloatingPanel from '../ui/floatingpanel';
 import { listExportHandler } from '../infowindow_exporthandler';
 
 const Search = function Search(options = {}) {
@@ -47,8 +47,15 @@ const Search = function Search(options = {}) {
     queryParameterName = 'q',
     autocompletePlacement,
     searchlistOptions = {},
-    queryType
+    queryType,
+    suppressDialog,
+    localization,
+    searchDelay = 400
   } = options;
+
+  function localize(key) {
+    return localization.getStringByKeys({ targetParentKey: 'search', targetKey: key });
+  }
 
   const searchlistPlacement = searchlistOptions.placement;
   let searchDb = {};
@@ -63,6 +70,7 @@ const Search = function Search(options = {}) {
   let containerElement;
   let wrapperElement;
   let infowindow;
+  let debounceTimer;
 
   function clear() {
     featureInfo.clear();
@@ -70,17 +78,30 @@ const Search = function Search(options = {}) {
       viewer.removeOverlays(overlay);
     }
   }
-
+  /**
+   * Displays the search result in an overlay (featureInfo's infoWindow-setting is ignored). Does not require that the features are from a layer.
+   * @param {any} features Array of features to display, but ony the first is actually displayed
+   * @param {any} objTitle Titel in the popup
+   * @param {any} content The html-content to be displayed the popup.
+   */
   function showFeatureInfo(features, objTitle, content) {
     const obj = {};
     obj.feature = features[0];
     obj.title = objTitle;
     obj.content = content;
     clear();
-    featureInfo.render([obj], 'overlay', getCenter(features[0].getGeometry()), { ignorePan: true });
+    // Call featureInfo to display search result in overlay. This does not obey featureInfo's 'infoWindow'-setting.
+    // Can't use featureInfo.ShowFeatureInfo here as that requires a layer to format content
+    featureInfo.render([obj], 'overlay', getCenter(features[0].getGeometry()), { ignorePan: true, suppressDialog });
     viewer.zoomToExtent(features[0].getGeometry(), maxZoomLevel);
   }
 
+  /**
+   * Shows an overlay with selected search result when there is no feature,
+   * just a coordinate and preformatted content.
+   * @param {any} data search result
+   * @param {any} coord where to show the popup
+   */
   function showOverlay(data, coord) {
     clear();
     const newPopup = popup(`#${viewer.getId()}`);
@@ -91,6 +112,7 @@ const Search = function Search(options = {}) {
     map.addOverlay(overlay);
 
     overlay.setPosition(coord);
+    // Take content from search result attribute named same as search attribute.
     const content = data[name];
     newPopup.setContent({
       content,
@@ -124,39 +146,60 @@ const Search = function Search(options = {}) {
     let content;
     let coord;
     if (layerNameAttribute && idAttribute) {
+      // This is option 1 above
+      // The search endpoint has only returned a layer name and a feature id. We must get the actual feature to get the geometry and
+      // let featureInfo format the popup content.
       const source = viewer.getMapSource();
       const projCode = viewer.getProjectionCode();
       const proj = viewer.getProjection();
       layer = viewer.getLayer(data[layerNameAttribute]);
       id = data[idAttribute];
+      // Fetch the feature from map server in case it is not fetched already by the layers source (in case of BBOX)
+      // or the layer is WMS, in which case source holds no features. getFeature() has a strnge behaviour to try to fetch features from
+      // feom a "shadow"-wfs layer by just assuming there is an wfs endpoint in the same location as WMS layer (works for GeoServer)
       getFeature(id, layer, source, projCode, proj)
         .then((res) => {
           let featureWkt;
           let coordWkt;
           if (res.length > 0) {
             const featLayerName = layer.get('name');
-            featureInfo.showFeatureInfo({ feature: res, layerName: featLayerName }, { maxZoomLevel });
+            featureInfo.showFeatureInfo({ feature: res, layerName: featLayerName }, { maxZoomLevel, suppressDialog });
           } else if (geometryAttribute) {
-            // Fallback if no geometry in response
+            // Fallback if the id was not present in the layer. Try to create feature from search endpoint result
+            // FIXME: this case is not documented and indicates some configuration error
             featureWkt = mapUtils.wktToFeature(data[geometryAttribute], projectionCode);
             coordWkt = featureWkt.getGeometry().getCoordinates();
             showOverlay(data, coordWkt);
           }
         });
     } else if (geometryAttribute && layerName) {
+      // This should probably be option 2 above, but the description is incorrect and it does not work.
+      // Feature is returned as a WKT and content is formatted using the layer's attributes configuration
+      // too bad the feature won't have any attributes as WKT only contains geometry.
+      // FIXME: according to description, feature should be fetched from server, not parsed from response and geometryattribute should not be necessary
+      // Maybe the intention was to receive a complete feature in geometryAttribute.
       feature = mapUtils.wktToFeature(data[geometryAttribute], projectionCode);
-      featureInfo.showFeatureInfo({ feature: [feature], layerName }, { maxZoomLevel });
+      featureInfo.showFeatureInfo({ feature: [feature], layerName }, { maxZoomLevel, suppressDialog });
     } else if (titleAttribute && contentAttribute && geometryAttribute) {
+      // This is option 3 above
+      // Search endpoint provides popup title, geometry as WKT and preformatted content.
       feature = mapUtils.wktToFeature(data[geometryAttribute], projectionCode);
 
       // Make sure the response is wrapped in a html element
       content = utils.createElement('div', data[contentAttribute]);
       showFeatureInfo([feature], data[titleAttribute], content);
     } else if (geometryAttribute && title) {
+      // This is option 4
+      // Search endpoint provides geometry as WKT, content is taken from same attribute that is configured as search attribute.
+      // FIXME: it should be documented that the content should/can be provided in the search result.
       feature = mapUtils.wktToFeature(data[geometryAttribute], projectionCode);
       content = utils.createElement('div', data[name]);
       showFeatureInfo([feature], title, content);
     } else if (easting && northing && title) {
+      // This is option 5.
+      // An overlay is displayed at the position specified by the attributes in the search result.
+      // content is taken from same attribute that is configured as search attribute
+      // FIXME: it should be documented that the content should/can be provided in the search result.
       coord = [data[easting], data[northing]];
       showOverlay(data, coord);
     } else {
@@ -348,7 +391,7 @@ const Search = function Search(options = {}) {
           const rows = [];
           if (searchlistOptions.makeSelectionButton) {
             const ids = resultArray.map(item => item[idAttribute]);
-            const buttonText = searchlistOptions.makeSelectionButtonText || 'Gör urval i kartan';
+            const buttonText = searchlistOptions.makeSelectionButtonText || localize('searchlistMakeSelectionButtonText');
             const makeSelectionButton = Button({
               cls: 'export-button',
               text: buttonText
@@ -392,7 +435,7 @@ const Search = function Search(options = {}) {
                     .then((res) => {
                       if (res.length > 0) {
                         const featureLayerName = layer.get('name');
-                        featureInfo.showFeatureInfo({ feature: res, layerName: featureLayerName }, { maxZoomLevel });
+                        featureInfo.showFeatureInfo({ feature: res, layerName: featureLayerName }, { maxZoomLevel, suppressDialog });
                       }
                     });
                 });
@@ -453,7 +496,7 @@ const Search = function Search(options = {}) {
       if (Object.keys(result).length > 0 && searchlistOptions.export && searchlistOptions.exportUrl) {
         const roundButton = searchlistOptions.roundButton;
         const buttonIcon = searchlistOptions.roundButtonIcon || '#fa-download';
-        const buttonText = searchlistOptions.exportButtonText || 'Export';
+        const buttonText = searchlistOptions.exportButtonText || localize('searchlistExportButtonText');
         const exportFileName = searchlistOptions.exportFilename || 'export.xlsx';
         const exportExcludedFields = searchlistOptions.exportExcludedFields || [];
         if (exportExcludedFields.length > 0) {
@@ -504,8 +547,9 @@ const Search = function Search(options = {}) {
           return `${content}`;
         }
       });
-      const searchlistTitle = searchlistOptions.title || 'Sökresultat för "{{value}}"';
+      const searchlistTitle = searchlistOptions.title || `${localize('searchlistTitle')} "{{value}}"`;
       infowindow.changeContent(listcomponent, `${searchlistTitle.replace('{{value}}', searchVal)}`);
+      infowindow.show();
     };
 
     function makeRequest(params) {
@@ -527,21 +571,24 @@ const Search = function Search(options = {}) {
       if (queryType) {
         queryUrl += `&t=${queryType}`;
       }
-      fetch(queryUrl)
-        .then(response => response.json())
-        .then((data) => {
-          let list = [];
-          searchDb = {};
-          if (data.length) {
-            setSearchDb(data);
-            if (name && groupSuggestions && !ignoreGroup) {
-              list = groupToList(groupDb(searchDb));
-            } else {
-              list = dbToList(data);
+      clearTimeout(debounceTimer);
+      debounceTimer = setTimeout(() => {
+        fetch(queryUrl)
+          .then(response => response.json())
+          .then((data) => {
+            let list = [];
+            searchDb = {};
+            if (data.length) {
+              setSearchDb(data);
+              if (name && groupSuggestions && !ignoreGroup) {
+                list = groupToList(groupDb(searchDb));
+              } else {
+                list = dbToList(data);
+              }
             }
-          }
-          reqHandler(list, searchVal, opt);
-        });
+            reqHandler(list, searchVal, opt);
+          });
+      }, complete ? 0 : searchDelay);
     }
 
     input.addEventListener('keyup', (e) => {
@@ -570,11 +617,12 @@ const Search = function Search(options = {}) {
           }
         }
       } else {
+        clearTimeout(debounceTimer);
         switch (searchlistPlacement) {
           case 'floating':
           case 'left':
             infowindowHandler([], '');
-            infowindow.close();
+            infowindow.hide();
             break;
           default:
             break;
@@ -612,7 +660,7 @@ const Search = function Search(options = {}) {
       this.render();
     },
     onInit() {
-      if (!hintText) hintText = 'Sök...';
+      if (!hintText) hintText = localize('hintText');
       searchButton = Button({
         cls: 'o-search-button no-shrink no-grow compact icon-small',
         icon: '#ic_search_24px',
@@ -630,7 +678,7 @@ const Search = function Search(options = {}) {
 
       containerElement = El({
         cls: 'o-search o-search-false flex row align-center padding-right-small',
-        innerHTML: `<input id="hjl" class="o-search-field form-control text-grey-darker" type="text" placeholder="${hintText}"></input>`
+        innerHTML: `<input id="hjl" class="o-search-field form-control text-grey-darker" type="text" placeholder="${localize('hintText')}"></input>`
       });
 
       wrapperElement = El({
@@ -670,7 +718,7 @@ const Search = function Search(options = {}) {
       bindUIActions();
 
       if (autocompletePlacement === 'floating' || searchlistPlacement === 'floating') {
-        infowindow = Infowindow({ viewer,
+        infowindow = FloatingPanel({ viewer,
           type: 'floating',
           contentComponent: El({
             tagName: 'div',
@@ -680,7 +728,7 @@ const Search = function Search(options = {}) {
         });
         this.addComponent(infowindow);
       } else if (autocompletePlacement === 'left' || searchlistPlacement === 'left') {
-        infowindow = Infowindow({ viewer,
+        infowindow = FloatingPanel({ viewer,
           type: 'left',
           contentComponent: El({
             tagName: 'div',

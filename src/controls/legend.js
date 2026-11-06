@@ -9,6 +9,12 @@ import LayerProperties from './legend/overlayproperties';
 import PopupMenu from '../ui/popupmenu';
 
 const Legend = function Legend(options = {}) {
+  const localization = options.localization;
+
+  function localize(key) {
+    return localization.getStringByKeys({ targetParentKey: 'legend', targetKey: key });
+  }
+
   const {
     cls: clsSettings = '',
     style: styleSettings = {},
@@ -26,7 +32,7 @@ const Legend = function Legend(options = {}) {
     searchLayersMinLength = 2,
     searchLayersLimit = 10,
     searchLayersParameters = ['name', 'title'],
-    searchLayersPlaceholderText = 'Sök lager'
+    searchLayersPlaceholderText = localize('placeholderText')
   } = options;
 
   let {
@@ -174,7 +180,7 @@ const Legend = function Legend(options = {}) {
 
   const turnOffLayersButton = Button({
     cls: 'round compact icon-small margin-x-smaller',
-    title: 'Släck alla lager',
+    title: localize('turnOffLayersTitle'),
     click() {
       viewer.dispatch('active:turnofflayers');
     },
@@ -190,7 +196,7 @@ const Legend = function Legend(options = {}) {
 
   const showVisibleLayersButton = Button({
     cls: 'compact icon-smaller margin-x-small hidden',
-    title: 'Visa endast tända lager',
+    title: localize('showVisibleTitle'),
     click() {
       viewer.dispatch('active:togglevisibleLayers');
     },
@@ -206,7 +212,7 @@ const Legend = function Legend(options = {}) {
 
   const showAllVisibleLayersButton = Button({
     cls: 'compact icon-smaller margin-x-small hidden',
-    title: 'Visa alla lager',
+    title: localize('showAllVisibleTitle'),
     click() {
       viewer.dispatch('active:togglevisibleLayers');
     },
@@ -231,7 +237,10 @@ const Legend = function Legend(options = {}) {
       visibleOverlaysCmp.dispatch('readOverlays');
       document.getElementById(toolsCmp.getId()).classList.add('hidden');
     } else {
-      document.getElementById(overlaysCmp.getId()).classList.remove('hidden');
+      const nrOverlays = overlaysCmp.getOverlays().length;
+      if (nrOverlays > 0) {
+        document.getElementById(overlaysCmp.getId()).classList.remove('hidden');
+      }
       document.getElementById(visibleOverlaysCmp.getId()).classList.add('hidden');
       document.getElementById(showAllVisibleLayersButton.getId()).classList.add('hidden');
       document.getElementById(showVisibleLayersButton.getId()).classList.remove('hidden');
@@ -247,7 +256,7 @@ const Legend = function Legend(options = {}) {
 
   const turnOnLayersButton = Button({
     cls: 'round compact icon-small margin-x-smaller',
-    title: 'Tänd alla lager utom bakgrundslager',
+    title: localize('turnOnLayersTitle'),
     click() {
       viewer.dispatch('active:turnonlayers');
     },
@@ -328,8 +337,8 @@ const Legend = function Legend(options = {}) {
       'align-self': 'center'
     },
     icon: '#o_add_24px',
-    ariaLabel: 'Lägg till lager',
-    title: 'Lägg till lager',
+    ariaLabel: localize('addLayerTitle'),
+    title: localize('addLayerTitle'),
     tabIndex: -1,
     validStates: ['initial', 'hidden'],
     state: 'hidden'
@@ -381,16 +390,40 @@ const Legend = function Legend(options = {}) {
     if (name) {
       // Todo
       const layer = viewer.getLayer(label);
-      const layerGroup = layer.get('group');
+      let layerGroup;
+      let isGroup;
+      if (typeof layer !== 'undefined') {
+        layerGroup = layer.get('group');
+      } else {
+        layerGroup = viewer.getGroup(label);
+        isGroup = true;
+      }
       const groupExclusive = (viewer.getGroup(layerGroup) && (viewer.getGroup(layerGroup).exclusive || viewer.getGroup(layerGroup).name === 'background'));
       if (groupExclusive) {
         const layers = viewer.getLayersByProperty('group', layerGroup);
         layers.forEach(l => l.setVisible(false));
       }
-      layer.setVisible(true);
+      if (isGroup) {
+        const layers = viewer.getLayersByProperty('group', label);
+        if (layerGroup.exclusive) { // If group is exclusive only make the first layer visible.
+          for (let i = 0; i < layers.length; i += 1) {
+            if (i === 0) {
+              if (!layers[i].get('secure')) {
+                layers[i].setVisible(true);
+              }
+            } else {
+              layers[i].setVisible(false);
+            }
+          }
+        } else {
+          layers.forEach(l => { if (!l.get('secure')) { l.setVisible(true); } });
+        }
+      } else if (!layer.get('secure')) {
+        layer.setVisible(true);
+      }
       document.getElementsByClassName('o-search-layer-field')[0].value = '';
     } else {
-      console.error('Search options are missing');
+      console.error(localize('selectHandlerError'));
     }
   }
 
@@ -457,28 +490,30 @@ const Legend = function Legend(options = {}) {
 
     function makeRequest(obj) {
       const layersArr = viewer.getLayers();
+      const groupsArr = viewer.getGroups();
       const hitArr = [];
+      const searchValue = obj.value.toLowerCase();
       layersArr.forEach((layer) => {
         if (layer.get('group') !== 'none') {
           let found = false;
           const label = layer.get('name');
           let value = label;
-          if (label.toLowerCase().search(obj.value.toLowerCase()) !== -1 && searchLayersParameters.includes('name')) {
+          if (label.toLowerCase().search(searchValue) !== -1 && searchLayersParameters.includes('name')) {
             found = true;
           }
           if (typeof layer.get('title') !== 'undefined' && searchLayersParameters.includes('title')) {
             value = layer.get('title');
-            if (value.toLowerCase().search(obj.value.toLowerCase()) !== -1) {
+            if (value.toLowerCase().search(searchValue) !== -1) {
               found = true;
             }
           }
           if (typeof layer.get('abstract') !== 'undefined' && searchLayersParameters.includes('abstract') && !found) {
             value = layer.get('abstract');
-            if (value.toLowerCase().search(obj.value.toLowerCase()) !== -1) {
+            if (value.toLowerCase().search(searchValue) !== -1) {
               found = true;
             }
             if (typeof layer.get('title') === 'undefined') {
-              value = `Titel saknas (${shorten(value, obj.value)})`;
+              value = `${localize('titleMissing')} (${shorten(value, obj.value)})`;
             } else {
               value = `${layer.get('title')} (${shorten(value, obj.value)})`;
             }
@@ -489,6 +524,26 @@ const Legend = function Legend(options = {}) {
             dataItem.value = value;
             hitArr.push(dataItem);
           }
+        }
+      });
+      groupsArr.forEach((group) => {
+        let found = false;
+        const label = group.name;
+        let value = label;
+        if (label.toLowerCase().search(searchValue) !== -1 && searchLayersParameters.includes('name')) {
+          found = true;
+        }
+        if (typeof group.title !== 'undefined' && searchLayersParameters.includes('title')) {
+          value = group.title;
+          if (value.toLowerCase().search(searchValue) !== -1) {
+            found = true;
+          }
+        }
+        if (found) {
+          const dataItem = {};
+          dataItem.label = label;
+          dataItem.value = `${value} ${localize('legendSearchGroupSuffix')}`;
+          hitArr.push(dataItem);
         }
       });
       awesomplete.list = hitArr;
@@ -562,7 +617,9 @@ const Legend = function Legend(options = {}) {
         addPopupMenuItems(button, this);
       } else {
         const toolsEl = document.getElementById(toolsCmp.getId());
-        toolsEl.classList.remove('hidden');
+        if (!visibleLayersViewActive) {
+          toolsEl.classList.remove('hidden');
+        }
         if (toolsCmp.getComponents().length > 0) {
           toolsEl.style.justifyContent = 'space-between';
           toolsEl.insertBefore(dom.html(divider.render()), toolsEl.firstChild);
@@ -642,16 +699,16 @@ const Legend = function Legend(options = {}) {
       target = document.getElementById(viewer.getMain().getId());
       const maxHeight = calcMaxHeight(getTargetHeight());
       overlaysCmp = Overlays({
-        viewer, cls: contentCls, style: contentStyle, labelOpacitySlider
+        viewer, cls: contentCls, style: contentStyle, labelOpacitySlider, localization
       });
       visibleOverlaysCmp = VisibleOverlays({
-        viewer, cls: `${contentCls} hidden`, style: contentStyle, labelOpacitySlider
+        viewer, cls: `${contentCls} hidden`, style: contentStyle, labelOpacitySlider, localization
       });
       const baselayerCmps = [toggleGroup];
 
       toolsCmp = El({
         cls: 'flex padding-small no-shrink hidden',
-        tooltipText: 'Lagerbytare',
+        tooltipText: localize('layerSwitcher'),
         style: {
           'background-color': '#fff',
           'justify-content': 'flex-end',
@@ -669,7 +726,7 @@ const Legend = function Legend(options = {}) {
         icon: '#ic_close_24px',
         state: closeButtonState,
         validStates: ['initial', 'hidden'],
-        ariaLabel: 'Stäng',
+        ariaLabel: localize('close'),
         click() {
           toggleVisibility();
         }
@@ -721,7 +778,7 @@ const Legend = function Legend(options = {}) {
         components: mainContainerComponents,
         style: {
           'max-height': `${maxHeight}px`,
-          width: 'min-content'
+          'min-width': '220px'
         }
       });
 
@@ -739,7 +796,7 @@ const Legend = function Legend(options = {}) {
       const layerButtonCls = isExpanded ? ' faded' : '';
       layerButton = Button({
         icon: '#ic_layers_24px',
-        tooltipText: 'Lager',
+        tooltipText: localize('layer'),
         tooltipPlacement: 'west',
         cls: `control icon-small medium round absolute light bottom-right${layerButtonCls}`,
         click() {

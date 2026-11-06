@@ -4,10 +4,14 @@ import Modify from 'ol/interaction/Modify';
 import Snap from 'ol/interaction/Snap';
 import Collection from 'ol/Collection';
 import Feature from 'ol/Feature';
-import { LineString, MultiPolygon, MultiLineString, MultiPoint } from 'ol/geom';
+import { LineString, MultiPolygon, MultiLineString, MultiPoint, Polygon } from 'ol/geom';
 import { noModifierKeys } from 'ol/events/condition';
-import { Button, Element as El, Modal } from '../../ui';
-import Infowindow from '../../components/infowindow';
+import VectorSource from 'ol/source/Vector';
+import VectorLayer from 'ol/layer/Vector';
+import { squaredDistance, toFixed } from 'ol/math';
+import { createEditingStyle } from 'ol/style/Style';
+import { Button, Element as El, Modal, Component } from '../../ui';
+import FloatingPanel from '../../ui/floatingpanel';
 import store from './editsstore';
 import generateUUID from '../../utils/generateuuid';
 import transactionHandler from './transactionhandler';
@@ -23,8 +27,12 @@ import topology from '../../utils/topology';
 import attachmentsform from './attachmentsform';
 import relatedTablesForm from './relatedtablesform';
 import relatedtables from '../../utils/relatedtables';
+import Style from '../../style';
+import { selectionStyle } from '../../style/drawstyles';
+import UndoStack from '../../utils/undostack';
 
 const editsStore = store();
+let localizeFunc;
 let editLayers = {};
 let autoSave;
 let autoForm;
@@ -55,20 +63,42 @@ let allowEditGeometry;
 /** List that tracks the state when editing related tables */
 let breadcrumbs = [];
 let autoCreatedFeature = false;
-let infowindowCmp = false;
+let floatingPanelCmp = false;
 let preselectedFeature;
+let traceHighligtLayer;
+let snapTolerance;
+let snapSources;
+let traceSource;
+let useTrace;
+let modifyDrawSnapInteraction;
+let modifyDrawInteraction;
+let component;
+let defaultSelectionStyle;
+let undoHandler;
+let clearUndoOnLayerChange;
+let clearUndoOnSessionEnd;
+let clearUndoOnToolChange;
+let reuseIds;
+let hasInteractions = false;
 
+/**
+ * Determine if the handler is active, i.e. has interactions. Not necessarily the same as the Editor Component is active.
+ * @returns true if handler i active
+ */
 function isActive() {
-  // FIXME: this only happens at startup as they are set to null on closing. If checking for null/falsley/not truely it could work as isVisible with
-  // the exption that it can not determine if it is visble before interactions are set, i.e. it can't be used to determine if interactions should be set.
-  // Right now it does not matter as it is not used anywhere critical.
-  if (modify === undefined || select === undefined) {
-    return false;
-  }
-  return true;
+  return hasInteractions;
 }
 
+/**
+ * Sets which (existing) interaction that should be active.
+ * @param {['modify' |  'draw' | 'custom' | null ]} editType  name of interaction
+ */
 function setActive(editType) {
+  map.removeInteraction(modifyDrawSnapInteraction);
+  modifyDrawSnapInteraction = null;
+  map.removeInteraction(modifyDrawInteraction);
+  modifyDrawInteraction = null;
+
   switch (editType) {
     case 'modify':
       draw.setActive(false);
@@ -180,11 +210,43 @@ function getDefaultValues(attrs) {
     }, {});
 }
 
+/**
+ * Helper that checks if we should reuse ids when undoing deletes by recreating the feature on server for this layer. Layer configuration
+ * overrides editor setting
+ * @param {any} layer
+ * @returns {boolean} true if ids should be reused
+ */
+function getReuseIdsForLayer(layer) {
+  const layerreuse = layer.get('reuseIds');
+  if (layerreuse !== undefined) {
+    return layerreuse;
+  }
+  return reuseIds;
+}
+
 function getSnapSources(layers) {
   return layers.map(layer => viewer.getLayer(layer).getSource());
 }
+
 /**
- * Saves the features to server.
+ * Helper to emit an Event so toolbar can update status of buttons
+ * @param {('edit' | 'undo' | 'redo' | 'clear')} change The change that has happened
+ */
+function emitUndoStackEvent(change) {
+  const stackDepth = undoHandler.getStackDepth();
+  dispatcher.emitUndoStackChange(change, stackDepth.undoDepth, stackDepth.redoDepth);
+}
+
+/**
+ * Clears the undostack and notifies toolbar
+ */
+function clearUndoStack() {
+  undoHandler.clear();
+  emitUndoStackEvent('clear');
+}
+
+/**
+ * Saves all features in editStore to server.
  * @returns A promise which is resolved when all features have been saved if the source supports it. Otherwise it is resolved immediately.
  * */
 async function saveFeatures() {
@@ -192,6 +254,7 @@ async function saveFeatures() {
   const layerNames = Object.getOwnPropertyNames(edits);
   const promises = [];
   layerNames.forEach((layerName) => {
+    const layer = viewer.getLayer(layerName);
     const transaction = {
       insert: null,
       delete: null,
@@ -199,7 +262,6 @@ async function saveFeatures() {
     };
     const editTypes = Object.getOwnPropertyNames(edits[layerName]);
     editTypes.forEach((editType) => {
-      const layer = viewer.getLayer(layerName);
       const ids = edits[layerName][editType];
       const features = getFeaturesByIds(editType, layer, ids);
       if (features.length) {
@@ -207,8 +269,11 @@ async function saveFeatures() {
       }
     });
     // If the source does not return a promise it is not awaited for in Promise.all, so this is pretty safe.
-    promises.push(transactionHandler(transaction, layerName, viewer));
+    promises.push(transactionHandler(transaction, layerName, viewer, { reuseIds: getReuseIdsForLayer(layer), localizeFunc }));
   });
+  if (!autoSave && clearUndoOnSessionEnd) {
+    clearUndoStack();
+  }
   return Promise.all(promises);
 }
 
@@ -220,7 +285,117 @@ async function saveFeatures() {
 async function saveFeature(change, ignoreAutoSave) {
   dispatcher.emitChangeFeature(change);
   if (autoSave && !ignoreAutoSave) {
-    await saveFeatures(change);
+    await saveFeatures();
+  }
+}
+
+function addEditsToEditStore(edits) {
+  edits.forEach(currEdit => {
+    dispatcher.emitChangeFeature(currEdit);
+  });
+  if (autoSave) {
+    // TODO: await?
+    saveFeatures();
+  }
+}
+
+/**
+ * Undo last operation
+ */
+function undo() {
+  const edits = undoHandler.undo();
+  emitUndoStackEvent('undo');
+  // Send edits to editstore
+  addEditsToEditStore(edits);
+}
+
+/**
+ * Redo last operation
+ */
+function redo() {
+  const edits = undoHandler.redo();
+  emitUndoStackEvent('redo');
+  // Send edits to editstore
+  addEditsToEditStore(edits);
+}
+
+function abortSession() {
+  // There actually is no such thing as a session, but reversing all pending edits
+  // is pretty similar. Can't just have editStore to clear its state as undoStack also hold references
+  // and may or may not contain all edits in the session, which also makes it unsuitable to
+  // use undoStack to get unmodified features
+
+  // These reversing actions can either be added to the undostack as one transaction to be able to undo the abortSession
+  // or the undoStack must be restored as well to avoid missmatch in undo. Maybe would have been a good idea to implement
+  // undo in the editStore instead ...
+
+  const undoOperations = [];
+  // Get all pending edits from store
+  const edits = editsStore.getEdits();
+  const layerNames = Object.getOwnPropertyNames(edits);
+  layerNames.forEach((layerName) => {
+    const layer = viewer.getLayer(layerName);
+
+    // Must take deletes first, as they can also have to be un-updated.
+    // If last edit is reversed
+    const deletedIds = edits[layerName]?.delete;
+    if (deletedIds) {
+      deletedIds.forEach(currFid => {
+        const deletedFeature = editsStore.getPendingDeletedFeature(layerName, currFid);
+        layer.getSource().addFeature(deletedFeature);
+        saveFeature({
+          feature: deletedFeature,
+          layerName,
+          action: 'insert'
+        });
+        undoOperations.push({ layer, featureRef: deletedFeature, op: 'insert' });
+      });
+    }
+
+    const updatedIds = edits[layerName]?.update;
+    if (updatedIds) {
+      updatedIds.forEach(currFid => {
+        const originalState = editsStore.getOriginalState(layerName, currFid);
+        const updatedFeature = layer.getSource().getFeatureById(currFid);
+        // Before is not actually used as editStore will cancel out the two updates,
+        // but if we are making it possible to undo abortSession it is needed for the undoStack.
+        const clone = updatedFeature.clone();
+        clone.setId(updatedFeature.getId());
+
+        updatedFeature.setProperties(originalState.getProperties());
+        // Geometry is included in properties, but it is a ref to an existing geometry instance
+        // Do an implicit deep copy to get rid of dependencies
+        updatedFeature.setGeometry(originalState.getGeometry().clone());
+        saveFeature({
+          feature: updatedFeature,
+          layerName,
+          action: 'update',
+          before: clone
+        });
+        undoOperations.push({ layer, featureRef: updatedFeature, op: 'update', before: clone });
+      });
+    }
+
+    const insertedIds = edits[layerName]?.insert;
+    if (insertedIds) {
+      insertedIds.forEach(currFid => {
+        const insertedFeature = layer.getSource().getFeatureById(currFid);
+        layer.getSource().removeFeature(insertedFeature);
+        saveFeature({
+          feature: insertedFeature,
+          layerName,
+          action: 'delete'
+        });
+        undoOperations.push({ layer, featureRef: insertedFeature, op: 'delete' });
+      });
+    }
+  });
+  if (clearUndoOnSessionEnd) {
+    clearUndoStack();
+  } else if (undoOperations.length) {
+    // Add all these reversions to undoStack as one undo-operation, making it possible to undo the abort.
+    undoHandler.pushEdits(undoOperations);
+    emitUndoStackEvent('edit');
   }
 }
 
@@ -230,19 +405,42 @@ function onModifyEnd(evt) {
   if (validateOnDraw && !topology.isGeometryValid(feature.getGeometry())) {
     feature.setGeometry(modifyGeometry);
   } else {
+    // clone and push to undo using modifyGeometry. Must clone here to use old geometry. Can't push to
+    // undo before modify as validation may fail and that would require an undo rollback (or programatic undo, but undo may not be available
+    // for this layer)
+    const unchanged = feature.clone();
+    unchanged.setGeometry(modifyGeometry);
+    const layer = viewer.getLayer(currentLayer);
+    undoHandler.pushEdit(layer, feature, 'update', unchanged);
     saveFeature({
       feature,
       layerName: currentLayer,
-      action: 'update'
+      action: 'update',
+      before: unchanged
     });
+    emitUndoStackEvent('edit');
   }
 }
 
 function onModifyStart(evt) {
   // Get a copy of the geometry before modification
-  if (validateOnDraw) {
-    modifyGeometry = evt.features.item(0).getGeometry().clone();
+  // if (validateOnDraw) {
+  modifyGeometry = evt.features.item(0).getGeometry().clone();
+  // }
+}
+
+function createId(layer) {
+  // Prefix id so we can determine if this feature is created in the editor or just happens to have a guid-like id
+  // from the server, which is highly unlikely. WFS prefixes id with layer name and AGS uses ObjectId, which is integer,
+  // but in this way we don't have to regex for a GUID where we need to know if it is newly created. We just checks if it starts
+  // with 'origotmp:'
+  // Prefix only if we should try to recreate deleted Ids on undo because if some older app is assuming that id is
+  // strictly a guid. As those older apps won't try recreating id:s they will still work.
+  let id = generateUUID();
+  if (getReuseIdsForLayer(layer)) {
+    id = `origotmp:${id}`;
   }
+  return id;
 }
 
 /**
@@ -255,8 +453,11 @@ async function addFeatureToLayer(feature, layerName) {
   const layer = viewer.getLayer(layerName);
   const defaultAttributes = getDefaultValues(layer.get('attributes'));
   feature.setProperties(defaultAttributes);
-  feature.setId(generateUUID());
+  feature.setId(createId(layer));
   layer.getSource().addFeature(feature);
+  // Add to undostack
+  undoHandler.pushEdit(layer, feature, 'insert');
+  emitUndoStackEvent('edit');
   return saveFeature({
     feature,
     layerName,
@@ -310,8 +511,17 @@ function ensureCorrectGeometryType(f) {
   return featureGeometryType === layerGeometryType;
 }
 
+/**
+ * Clears all traces of an active trace
+ */
+function clearTrace() {
+  traceHighligtLayer.getSource().clear();
+  traceSource.clear();
+}
+
 // Handler for OL Draw interaction
 function onDrawEnd(evt) {
+  clearTrace();
   const f = evt.feature;
 
   // Reset pointer to drawFeature, OL resuses the same feature
@@ -332,7 +542,7 @@ function onDrawEnd(evt) {
 
   // If live validation did its job, we should not have to validate here, but freehand bypasses all controls and we can't tell if freehand was used.
   if (validateOnDraw && !topology.isGeometryValid(f.getGeometry())) {
-    alert('Kan ej spara, geometrin är ogiltig');
+    viewer.getLogger().createToast({ status: 'danger', message: localizeFunc('invalidGeometryMsg'), title: localizeFunc('generalErrorTitle') });
   } else {
     addFeature(evt.feature);
   }
@@ -349,10 +559,11 @@ function onDrawStart(evt) {
 }
 
 /**
- * Called when draw is aborted from OL
+ * Called when draw is aborted from OL, typically by shift-click
  * */
 function onDrawAbort() {
   drawFeature = null;
+  clearTrace();
 }
 /**
  * Called by OL on mouse down to check if a vertex should be added
@@ -458,7 +669,7 @@ function onCustomDrawEnd(e) {
   const feature = e.detail.feature;
   if (feature) {
     if (!ensureCorrectGeometryType(feature)) {
-      alert('Kan inte lägga till en geometri av den typen i det lagret');
+      viewer.getLogger().createToast({ status: 'danger', message: localizeFunc('badGeometryType'), title: localizeFunc('generalErrorTitle') });
     } else {
       // Must move geometry to correct property. Setting geometryName is not enough.
       if (editLayers[currentLayer].get('geometryName') !== feature.getGeometryName()) {
@@ -476,7 +687,8 @@ function addSnapInteraction(sources) {
   const snapInteractions = [];
   sources.forEach((source) => {
     const interaction = new Snap({
-      source
+      source,
+      pixelTolerance: snapTolerance
     });
     snapInteractions.push(interaction);
     map.addInteraction(interaction);
@@ -485,21 +697,23 @@ function addSnapInteraction(sources) {
 }
 
 function removeInteractions() {
-  if (isActive()) {
-    map.removeInteraction(modify);
-    map.removeInteraction(select);
-    map.removeInteraction(draw);
-    if (snap) {
-      snap.forEach((snapInteraction) => {
-        map.removeInteraction(snapInteraction);
-      });
-    }
-
-    modify = null;
-    select = null;
-    draw = null;
-    snap = null;
+  map.removeInteraction(modify);
+  map.removeInteraction(select);
+  map.removeInteraction(draw);
+  if (snap) {
+    snap.forEach((snapInteraction) => {
+      map.removeInteraction(snapInteraction);
+    });
   }
+
+  modify = null;
+  select = null;
+  draw = null;
+  snap = null;
+  hasInteractions = false;
+  // The select interaction is deleted and recreated so we must send the select event manually as
+  // the selection collection events are not fired when interaction is destroyed effectively selecting nothing.
+  component.dispatch('select', []);
 }
 
 function setAllowedOperations() {
@@ -518,14 +732,146 @@ function setAllowedOperations() {
   }
 }
 
+/**
+ * Helper that adds candidate linear strings as features to be displayed as trace possibilities if they
+ * are clicked on. Mimics what OL does in Draw interaction, but in less code as it uses higher level functions
+ * @param {any} coordinate
+ * @param {any} coordinates
+ */
+function appendTraceTarget(coordinate, coordinates) {
+  const x = coordinate[0];
+  const y = coordinate[1];
+  const geom = new LineString(coordinates);
+  const nearestPoint = geom.getClosestPoint(coordinate);
+  // Round distance so we can determine if point is on line. It still is pretty small so
+  // snapping must be activated in order to have any chance at actually hitting a line.
+  const squaredD = toFixed(squaredDistance(x, y, nearestPoint[0], nearestPoint[1]), 10);
+  if (squaredD === 0) {
+    traceHighligtLayer.getSource().addFeature(new Feature(geom));
+  }
+}
+
+/**
+ * Breaks down a complex geometry to linearstrings that can be traced.
+ * Mimics the implementation in OL
+ * @param {any} coordinate
+ * @param {any} geometry
+ * @returns
+ */
+function appendGeometryTraceTargets(coordinate, geometry) {
+  if (geometry instanceof LineString) {
+    appendTraceTarget(coordinate, geometry.getCoordinates());
+    return;
+  }
+  if (geometry instanceof MultiLineString || geometry instanceof Polygon) {
+    const coordinates = geometry.getCoordinates();
+    coordinates.forEach(currRing => {
+      appendTraceTarget(coordinate, currRing);
+    });
+    return;
+  }
+  if (geometry instanceof MultiPolygon) {
+    const polys = geometry.getCoordinates();
+    polys.forEach(currPoly => {
+      currPoly.forEach(currRing => {
+        appendTraceTarget(coordinate, currRing);
+      });
+    });
+  }
+  // other types cannot be traced
+}
+
+/**
+ * Callback that OL draw calls before a trace is started or ended. Too bad we don't get to know why it is called
+ * Sets up features for tracing, as trace can only handle one vector source, so we have do load candidates into one source
+ * to support tracing from all layers that we can snap to.
+ * @param {any} evt
+ * @returns {boolean} If false operation will be aborted
+ */
+function traceCallback(evt) {
+  // Try to figure out if we're about to start or end a trace. As OL won't let us know which it is we have to guess,
+  // so don't base any crucial logic around it.
+  const traceActive = traceHighligtLayer.getSource().getFeatures().length > 0;
+
+  // Get som candidates for snapping where we clicked. It will contain a lot of false positives.
+  // This is roughly the same algorithm as OL uses, which means layer does not have to be visible!
+  // Actual snap tolerance value is actually not important, mouse has already snapped and OL uses another value,
+  // but it is a nice value to use.
+  const lowerLeft = map.getCoordinateFromPixel([
+    evt.pixel[0] - snapTolerance,
+    evt.pixel[1] + snapTolerance
+  ]);
+  const upperRight = map.getCoordinateFromPixel([
+    evt.pixel[0] + snapTolerance,
+    evt.pixel[1] - snapTolerance
+  ]);
+  const extent = [lowerLeft[0], lowerLeft[1], upperRight[0], upperRight[1]];
+  const candidateFeatures = [];
+  snapSources.forEach(currSource => {
+    candidateFeatures.push(...currSource.getFeaturesInExtent(extent));
+  });
+  clearTrace();
+  // This is what Draw interaction gets, it will narrow it down itself
+  traceSource.addFeatures(candidateFeatures);
+  // Try to figure out which segments OL will use for tracing by mimicing their method and
+  // add all segments as features to visualize where it is possible to trace.
+  // It would have been a lot easier if OL just had exposed getTraceTargets()
+  // As we don't know for sure if we're actually starting or ending trace, we just toggle visibility of
+  // possible trace linestrings. OL will hopefully always do the right thing, but if we don't mimic OL exactly
+  // the visualization may be out of sync until drawing is finished or aborted.
+  if (!traceActive) {
+    candidateFeatures.forEach(currCandidate => {
+      appendGeometryTraceTargets(evt.coordinate, currCandidate.getGeometry());
+    });
+  }
+
+  // Return true to allow the trace start/stop.
+  return true;
+}
+
+/**
+ * Creates a style function that returns styles for selecting a feature for modification
+ * Uses the same default symbol that Select interaction uses, but adds points on all vertices.
+ * The function handles all geometry types.
+ * Most of this function is knicked from ol/interaction/Select getDefaultStyleFunction(), but that is not exported
+ * @returns A function that return styles
+ */
+function getDefaultSelectStyleFunction() {
+  // Get same default symbol that select uses.
+  const styles = createEditingStyle();
+  // For some odd reason createEditingStyle does not create outlines on polygons, so we add them here
+  // This is exactly what ol/interaction/Select getDefaultStyleFunction() also does, but they forgot MultiPolygon
+  styles.Polygon = styles.Polygon.concat(styles.LineString);
+  styles.MultiPolygon = styles.MultiPolygon.concat(styles.LineString);
+  styles.GeometryCollection = styles.GeometryCollection.concat(styles.LineString);
+
+  // Return the actual styling function
+  return (feature) => {
+    if (!feature.getGeometry()) {
+      return null;
+    }
+    const geometryType = feature.getGeometry().getType();
+    if (geometryType === 'Point' || geometryType === 'MultiPoint') {
+      return styles[geometryType];
+    }
+    // For non-points, add the vertices styles from drawstyles
+    return [...styles[geometryType], selectionStyle];
+  };
+}
+
 function setInteractions(drawType) {
   const editLayer = editLayers[currentLayer];
   attributes = editLayer.get('attributes');
   title = editLayer.get('title') || 'Information';
+  hasSnap = editLayer.get('snap');
   const drawOptions = {
     type: editLayer.get('geometryType'),
-    geometryName: editLayer.get('geometryName')
+    geometryName: editLayer.get('geometryName'),
+    traceSource
   };
+  if (hasSnap && useTrace) {
+    drawOptions.trace = traceCallback;
+  }
   if (drawType) {
     Object.assign(drawOptions, shapes(drawType));
   }
@@ -538,10 +884,24 @@ function setInteractions(drawType) {
   hasDraw = false;
   select = new Select({
     layers: [editLayer],
-    multi: !!infowindowCmp
+    multi: !!floatingPanelCmp,
+    // For now just short circuit the style function and use OL default. If the style should be customizable the check
+    // should be performed in the style function
+    style: allowEditGeometry ? defaultSelectionStyle : undefined
   });
-  if (infowindowCmp) {
-    infowindowCmp.close();
+  // Dispatch Component event when selection changes. 'change' is never emitted from Collection, so it's both 'add' and 'remove'.
+  // select interaction's 'select' event is not fired when the feature collection is manipulated manually, so we take events from
+  // the collection instead.
+  select.getFeatures().on('add', () => {
+    const featureArray = select.getFeatures().getArray();
+    component.dispatch('select', featureArray);
+  });
+  select.getFeatures().on('remove', () => {
+    const featureArray = select.getFeatures().getArray();
+    component.dispatch('select', featureArray);
+  });
+  if (floatingPanelCmp) {
+    floatingPanelCmp.hide();
     select.on('select', () => {
       if (select.getFeatures().getLength() > 1) {
         const featureListAttributes = editLayer.get('featureListAttributes');
@@ -571,14 +931,14 @@ function setInteractions(drawType) {
             click() {
               select.getFeatures().clear();
               select.getFeatures().push(feature);
-              infowindowCmp.dispatch('resetButtonStates');
-              infowindowCmp.dispatch('removeMouseenter');
+              floatingPanelCmp.dispatch('resetButtonStates');
+              floatingPanelCmp.dispatch('removeMouseenter');
               this.setState('active');
             },
             mouseenter() {
               select.getFeatures().clear();
               select.getFeatures().push(feature);
-              infowindowCmp.dispatch('resetButtonStates');
+              floatingPanelCmp.dispatch('resetButtonStates');
               this.setState('active');
             }
           });
@@ -587,13 +947,13 @@ function setInteractions(drawType) {
             components: [featureButton]
           });
           listCmp.push(listItem);
-          infowindowCmp.on('resetButtonStates', () => {
+          floatingPanelCmp.on('resetButtonStates', () => {
             featureButton.setState('initial');
             if (document.getElementById(featureButton.getId())) {
               document.getElementById(featureButton.getId()).blur();
             }
           });
-          infowindowCmp.on('removeMouseenter', () => {
+          floatingPanelCmp.on('removeMouseenter', () => {
             featureButton.dispatch('removeMouseenter');
           });
         });
@@ -601,9 +961,10 @@ function setInteractions(drawType) {
           tagName: 'ul',
           components: listCmp
         });
-        infowindowCmp.changeContent(content);
+        floatingPanelCmp.changeContent(content);
+        floatingPanelCmp.show();
       } else {
-        infowindowCmp.close();
+        floatingPanelCmp.hide();
       }
     });
   }
@@ -632,14 +993,14 @@ function setInteractions(drawType) {
   setActive();
 
   // If snap should be active then add snap internactions for all snap layers
-  hasSnap = editLayer.get('snap');
   if (hasSnap) {
     // FIXME: selection will almost certainly be empty as featureInfo is cleared
     const selectionSource = featureInfo.getSelectionLayer().getSource();
-    const snapSources = editLayer.get('snapLayers') ? getSnapSources(editLayer.get('snapLayers')) : [editLayer.get('source')];
+    snapSources = editLayer.get('snapLayers') ? getSnapSources(editLayer.get('snapLayers')) : [editLayer.get('source')];
     snapSources.push(selectionSource);
     snap = addSnapInteraction(snapSources);
   }
+  hasInteractions = true;
 }
 
 /** Closes all modals and resets breadcrumbs */
@@ -665,12 +1026,15 @@ function setEditLayer(layerName) {
   currentLayer = layerName;
   setAllowedOperations();
   setInteractions();
+  if (clearUndoOnLayerChange) {
+    clearUndoStack();
+  }
 }
 
 function setGeometryProps(layer) {
   const layerName = layer.get('name');
   editLayers[layerName].set('geometryType', layer.getSource().getFeatures()[0].getGeometry().getType());
-  if (layerName === currentLayer) {
+  if (layerName === currentLayer && isActive()) {
     setEditLayer(layerName);
   }
 }
@@ -694,8 +1058,8 @@ function setEditProps(options) {
     const layer = viewer.getLayer(layerName);
     const layerProperties = layerProps;
     const snapLayers = options.snapLayers || editableLayers;
-    snap = 'snap' in options ? options.snap : true;
-    layer.set('snap', snap);
+    const snapOn = 'snap' in options ? options.snap : true;
+    layer.set('snap', snapOn);
     layer.set('snapLayers', snapLayers);
     layerProperties[layerName] = layer;
     return layerProps;
@@ -709,9 +1073,10 @@ function setEditProps(options) {
  * @param {any} feature The feature to delete
  * @param {any} layer The layer in which the feature is
  * @param {any} supressDbDelete True if the feature should in fact not be deleted from db. Defaults to false. Mainly used by recursive calls.
+ * @param {any} undoItems Array of undo items that is populated in each recursion when a delete is recursive
  * @returns a promise which is resolved when feature is deleted from db (or immediately id not autosave)
  */
-async function deleteFeature(feature, layer, supressDbDelete) {
+async function deleteFeatureRecurseHelper(feature, layer, supressDbDelete, undoItems) {
   // If editor is in auto save mode we can delete in the correct order by start by recursing before deleting anything
   // If editor is not in auto save, it is up to the transactionhandler in combination with the map server if
   // delete order is preserved. Better not have any db constraints if mode is 'cascade'.
@@ -734,7 +1099,7 @@ async function deleteFeature(feature, layer, supressDbDelete) {
           const currChildFeature = childFeatures[jx];
           // This funtion is recursive, we have to await
           // eslint-disable-next-line no-await-in-loop
-          await deleteFeature(currChildFeature, childLayer, deleteMode === 'db');
+          await deleteFeatureRecurseHelper(currChildFeature, childLayer, deleteMode === 'db', undoItems);
         }
       }
     }
@@ -749,8 +1114,36 @@ async function deleteFeature(feature, layer, supressDbDelete) {
       action: 'delete'
     });
   }
+
+  // Add this delete to the undo transaction. If related item has cascadingDelete = 'db' we assume it
+  // also is deleted in database so we can recreate children as well. If conficured with cascadingDelete = 'db' and
+  // there is no cascading delete in db we will get duplicate items in db, which may or not be a problem.
+  undoItems.push(
+    {
+      layer,
+      featureRef: feature,
+      op: 'delete'
+    }
+  );
+
+  // Actually remove it from layer
   const source = layer.getSource();
   source.removeFeature(feature);
+}
+
+/**
+ * Deletes a feature. If the feature belongs to a layer that has related layers the deletion is recursive
+ * if configured so in the relation configuration.
+ * @param {any} feature The feature to delete
+ * @param {any} layer The layer in which the feature is
+ * @returns a promise which is resolved when feature is deleted from db (or immediately id not autosave)
+ */
+async function deleteFeature(feature, layer) {
+  // Use an array to collect all deletes in one undo transaction for handling cascading deletes when using related tables.
+  const undoItems = [];
+  await deleteFeatureRecurseHelper(feature, layer, false, undoItems);
+  undoHandler.pushEdits(undoItems);
+  emitUndoStackEvent('edit');
 }
 
 function onDeleteSelected() {
@@ -760,23 +1153,30 @@ function onDeleteSelected() {
   // const editSource = editLayers[currentLayer].getSource();
   if (features.getLength() === 1) {
     const feature = features.item(0);
-    const r = window.confirm('Är du säker på att du vill ta bort det här objektet?');
+    const r = window.confirm(localizeFunc('deleteConfirm'));
     if (r === true) {
       deleteFeature(feature, editLayers[currentLayer]).then(() => select.getFeatures().clear());
     }
   }
 }
 
+/**
+ * Starts the draw tool if the current layer has a defined geometryType.
+ */
 function startDraw() {
   if (!editLayers[currentLayer].get('geometryType')) {
-    alert(`"geometryType" har inte angivits för ${editLayers[currentLayer].get('name')}`);
-  } else if (hasDraw !== true && isActive()) {
+    // This is a configuration error. No need to localize
+    alert(`"geometryType" is not configured for layer ${editLayers[currentLayer].get('name')}`);
+  } else if (!hasDraw) {
     setActive('draw');
     hasDraw = true;
     dispatcher.emitChangeEdit('draw', true);
   }
 }
 
+/**
+ * Cancels the draw tool and resets relevant states.
+ */
 function cancelDraw() {
   setActive();
   if (hasDraw) {
@@ -805,7 +1205,7 @@ function onChangeShape(e) {
  */
 function refreshRelatedTablesForm(feature) {
   const relatedTablesFormEl = document.getElementById(`o-relatedtables-form-${currentLayer}`);
-  relatedTablesForm(viewer, viewer.getLayer(currentLayer), feature, relatedTablesFormEl);
+  relatedTablesForm(viewer, viewer.getLayer(currentLayer), feature, relatedTablesFormEl, { localizeFunc });
 }
 
 /** Called when the edit form modal is closed. Reverts the editor state to edit the parent object if the modal was a child table */
@@ -838,19 +1238,37 @@ function onModalClosed() {
  * @param {any} formEl The attributes to set on features
  */
 function attributesSaveHandler(features, formEl) {
+  const undoOperations = [];
+  const layer = viewer.getLayer(currentLayer);
+
   features.forEach(feature => {
+    // Must create before manually to add all features as an undo batch
+    const before = feature.clone();
+    // Use same id. Can not add to same source after this.
+    before.setId(feature.getId());
+    undoOperations.push({
+      layer,
+      featureRef: feature,
+      op: 'update',
+      before
+
+    });
     // get DOM values and set attribute values to feature
     attributes.forEach((attribute) => {
       if (Object.prototype.hasOwnProperty.call(formEl, attribute.name)) {
         feature.set(attribute.name, formEl[attribute.name]);
       }
     });
+
     saveFeature({
       feature,
       layerName: currentLayer,
-      action: 'update'
+      action: 'update',
+      before
     }, true);
   });
+  undoHandler.pushEdits(undoOperations);
+  emitUndoStackEvent('edit');
   // Take control of auto save here to avoid one transaction per feature when batch editing
   if (autoSave) {
     saveFeatures();
@@ -888,24 +1306,49 @@ function onAttributesSave(features, attrs) {
   document.getElementById(`o-save-button-${currentLayer}`).addEventListener('click', (e) => {
     const editEl = {};
     const valid = {};
+    let checkboxValues = [];
     attrs.forEach((attribute) => {
       // Get the input container class
       const containerClass = `.${attribute.elId}`;
       // Get the input attributes
       // FIXME: Don't have to get from DOM, the same values are in 'attribute'
       // and it would be enough to call getElementId once anyway (called numerous times later on).
-      const inputType = document.getElementById(attribute.elId).getAttribute('type');
-      const inputValue = document.getElementById(attribute.elId).value;
-      const inputName = document.getElementById(attribute.elId).getAttribute('name');
-      const inputId = document.getElementById(attribute.elId).getAttribute('id');
-      const inputRequired = document.getElementById(attribute.elId).required;
+
+      let inputType = attribute.type ? attribute.type : '';
+      // Check again for not missing when checkbox is part of multiple choice checkboxes
+      inputType = document.getElementById(`${attribute.elId}-0`) ? 'checkboxgroup' : inputType;
+      const inputValue = document.getElementById(attribute.elId) ? document.getElementById(attribute.elId).value : '';
+      const inputName = attribute.name ? attribute.name : '';
+      const inputId = attribute.elId ? attribute.elId : '';
+      const inputRequired = document.getElementById(attribute.elId) ? document.getElementById(attribute.elId).required : '';
 
       // If hidden element it should be excluded
       // By sheer luck, this prevents attributes to be changed in batch edit mode when checkbox is not checked.
       // If this code is changed, it may be necessary to excplict check if the batch edit checkbox is checked for this attribute.
       if (!document.querySelector(containerClass) || document.querySelector(containerClass).classList.contains('o-hidden') === false) {
         // Check if checkbox. If checkbox read state.
-        if (inputType === 'checkbox') {
+        if (inputType === 'checkboxgroup') {
+          if (document.getElementById(`${attribute.elId}-0`).getAttribute('type') === 'checkbox') {
+            const separator = attribute.separator ? attribute.separator : ';';
+            const freetextOptionPrefix = attribute.freetextOptionPrefix ? attribute.freetextOptionPrefix : 'freetext_option:';
+            const freetextOptionValueSeparator = attribute.freetextOptionValueSeparator ? attribute.freetextOptionValueSeparator : '=';
+            if (attribute.options && attribute.options.length > 0) {
+              Array.from(document.getElementsByName(attribute.name)).forEach((element) => {
+                if (element.tagName === 'INPUT' && element.getAttribute('type') === 'checkbox' && element.checked === true) {
+                  // Check if this is a free text checkbox
+                  if (element.nextElementSibling.getAttribute('type') === 'text') {
+                    checkboxValues.push(`${freetextOptionPrefix}${element.getAttribute('value')}${freetextOptionValueSeparator}${element.nextElementSibling.value.trim()}`);
+                  } else {
+                    checkboxValues.push(element.getAttribute('value'));
+                  }
+                }
+              });
+              editEl[attribute.name] = checkboxValues.join(separator);
+            } else {
+              editEl[attribute.name] = document.getElementById(attribute.elId).checked ? 1 : 0;
+            }
+          }
+        } else if (inputType === 'checkbox') {
           const checkedValue = (attribute.config && attribute.config.checkedValue) || 1;
           const uncheckedValue = (attribute.config && attribute.config.uncheckedValue) || 0;
           editEl[attribute.name] = document.getElementById(attribute.elId).checked ? checkedValue : uncheckedValue;
@@ -915,8 +1358,8 @@ function onAttributesSave(features, attrs) {
           // No other validation is performed on searchList as the only thing that can be checked now is that value is in list
           // and that is handled inside the searchList itself.
           editEl[attribute.name] = attribute.searchList.getValue();
-        } else if (attribute.type === 'image') {
-          // File input's value is the filename, but the image itself is stored in the model
+        } else if (attribute.type === 'image' || attribute.type === 'audio' || attribute.type === 'video') {
+          // File input's value is the filename, but the media itself is stored in the model
           editEl[attribute.name] = attribute.val;
         } else { // Read value from input text, textarea or select
           editEl[attribute.name] = inputValue;
@@ -927,7 +1370,7 @@ function onAttributesSave(features, attrs) {
       const errorOn = document.querySelector(`[id="${inputId}"]`);
       const errorCls = `.o-${inputId}`;
       const errorMsg = document.querySelector(errorCls);
-      const errorText = `Vänligen ange korrekt ${inputName}`;
+      const errorText = `${localizeFunc('invalidField')} ${inputName}`;
       const requiredOn = document.querySelector(`[id="${inputId}"]`);
       const requiredCls = `.o-${inputId}-requiredMsg`;
       const requiredMsg = document.querySelector(requiredCls);
@@ -936,9 +1379,9 @@ function onAttributesSave(features, attrs) {
       if (!valid.required && inputRequired && inputValue === '') {
         if (!requiredMsg) {
           if (requiredOn.getAttribute('class') === 'awesomplete') {
-            requiredOn.parentNode.insertAdjacentHTML('afterend', `<div class="o-${inputId}-requiredMsg errorMsg fade-in padding-bottom-small">Obligatoriskt fält</div>`);
+            requiredOn.parentNode.insertAdjacentHTML('afterend', `<div class="o-${inputId}-requiredMsg errorMsg fade-in padding-bottom-small">${localizeFunc('mandatoryField')}</div>`);
           } else {
-            requiredOn.insertAdjacentHTML('afterend', `<div class="o-${inputId}-requiredMsg errorMsg fade-in padding-bottom-small">Obligatoriskt fält</div>`);
+            requiredOn.insertAdjacentHTML('afterend', `<div class="o-${inputId}-requiredMsg errorMsg fade-in padding-bottom-small">${localizeFunc('mandatoryField')}`);
           }
         }
       } else if (requiredMsg) {
@@ -1046,6 +1489,26 @@ function onAttributesSave(features, attrs) {
             errorMsg.remove();
           }
           break;
+        case 'audio':
+          valid.audio = validate.audio(inputValue) || inputValue === '' ? inputValue : false;
+          if (!valid.audio && inputValue !== '') {
+            if (!errorMsg) {
+              errorOn.insertAdjacentHTML('afterend', `<div class="o-${inputId} errorMsg fade-in padding-bottom-small">${errorText}</div>`);
+            }
+          } else if (errorMsg) {
+            errorMsg.remove();
+          }
+          break;
+        case 'video':
+          valid.video = validate.video(inputValue) || inputValue === '' ? inputValue : false;
+          if (!valid.video && inputValue !== '') {
+            if (!errorMsg) {
+              errorOn.insertAdjacentHTML('afterend', `<div class="o-${inputId} errorMsg fade-in padding-bottom-small">${errorText}</div>`);
+            }
+          } else if (errorMsg) {
+            errorMsg.remove();
+          }
+          break;
         case 'color':
           valid.color = validate.color(inputValue) || inputValue === '' ? inputValue : false;
           if (!valid.color && inputValue !== '') {
@@ -1060,6 +1523,7 @@ function onAttributesSave(features, attrs) {
         default:
       }
       valid.validates = !Object.values(valid).includes(false);
+      checkboxValues = [];
     });
 
     // If valid, continue
@@ -1075,6 +1539,10 @@ function onAttributesSave(features, attrs) {
   });
 }
 
+/**
+ * Adds an event listener to a dependency element and toggles the visibility of a container element.
+ * @returns {Function} A function that accepts an object to configure the event listener.
+ */
 function addListener() {
   const fn = (obj) => {
     document.getElementById(obj.elDependencyId).addEventListener(obj.eventType, () => {
@@ -1098,6 +1566,35 @@ function addListener() {
 }
 
 /**
+ * Returns a function that adds an event handler to enable/disable the textbox for a free text checkbox
+ *
+ * @function
+ * @name addCheckboxListener
+ * @kind function
+ * @param {any} ): (obj
+ * @returns {void}
+ */
+function addCheckboxListener() {
+  const fn = (obj) => {
+    Array.from(document.getElementsByName(obj.name)).forEach((element) => {
+      // Add a listener on the checkbox if it has input text as next element
+      if (element.tagName === 'INPUT' && element.getAttribute('type') === 'checkbox' && element.nextElementSibling.getAttribute('type') === 'text') {
+        element.addEventListener('change', () => {
+          if (element.checked === true) {
+            document.getElementById(element.nextElementSibling.id).disabled = false;
+          } else {
+            document.getElementById(element.nextElementSibling.id).value = '';
+            document.getElementById(element.nextElementSibling.id).disabled = true;
+          }
+        });
+      }
+    });
+  };
+
+  return fn;
+}
+
+/**
  * Returns a function that adds an event handler to read an image file when user selects a file.
  * */
 function addImageListener() {
@@ -1107,7 +1604,7 @@ function addImageListener() {
     document.querySelector(`#${obj.elId}`).addEventListener('change', (ev) => {
       if (ev.target.files && ev.target.files[0]) {
         document.querySelector(`${containerClass} img`).classList.remove('o-hidden');
-        document.querySelector(`${containerClass} input[type=button]`).classList.remove('o-hidden');
+        document.querySelector(`${containerClass} .o-delete-image-button`).classList.remove('o-hidden');
         fileReader.onload = () => {
           // When the file has been read, rotate it and resize to configured max size or default max
           // Don't know why it's rotated. Probably something to do with iphones that store images upside down.
@@ -1126,13 +1623,129 @@ function addImageListener() {
       }
     });
     // Find the remove button and attach event handler.
-    document.querySelector(`${containerClass} input[type=button]`).addEventListener('click', (e) => {
+    document.querySelector(`${containerClass} .o-delete-image-button`).addEventListener('click', (e) => {
       // Clear the filename
       document.getElementById(obj.elId).value = '';
       // Also clear the model value
       // eslint-disable-next-line no-param-reassign
       obj.val = '';
       document.querySelector(`${containerClass} img`).classList.add('o-hidden');
+      e.target.classList.add('o-hidden');
+    });
+  };
+
+  return fn;
+}
+
+/**
+ * Returns a function that adds an event handler to read an audio file when user selects a file.
+ *
+ * @function
+ * @name addAudioListener
+ * @kind function
+ * @param {any} ): (obj
+ * @returns {void}
+ */
+function addAudioListener() {
+  const fn = (obj) => {
+    const fileReader = new FileReader();
+    const containerElement = document.getElementsByClassName(`.${obj.elId}`);
+
+    if (!containerElement) return;
+    const inputElement = document.querySelector(`.${obj.elId} .o-hidden-fileselector`);
+    const inputUrlElement = document.querySelector(`.${obj.elId} > input[type='url']`);
+    const audioElement = document.querySelector(`.${obj.elId} > audio:first-of-type`);
+    const buttonElement = document.querySelector(`.${obj.elId} > input[type='button']`);
+
+    inputElement.addEventListener('change', (ev) => {
+      if (ev.target.files && ev.target.files[0]) {
+        audioElement.classList.remove('o-hidden');
+        buttonElement.classList.remove('o-hidden');
+        fileReader.onload = (e) => {
+          audioElement.src = e.target.result;
+          // eslint-disable-next-line no-param-reassign
+          obj.val = e.target.result;
+        };
+        fileReader.readAsDataURL(ev.target.files[0]);
+      }
+    });
+    inputUrlElement.addEventListener('input', () => {
+      audioElement.classList.remove('o-hidden');
+      buttonElement.classList.remove('o-hidden');
+      audioElement.src = inputUrlElement.value;
+      // eslint-disable-next-line no-param-reassign
+      obj.val = inputUrlElement.value;
+    });
+
+    // Find the remove button and attach event handler.
+    buttonElement.addEventListener('click', (e) => {
+      // Clear the filename
+      document.getElementById(obj.elId).value = '';
+      // Also clear the model value
+      // eslint-disable-next-line no-param-reassign
+      obj.val = '';
+      inputElement.value = '';
+      inputUrlElement.value = '';
+      audioElement.classList.add('o-hidden');
+      buttonElement.classList.add('o-hidden');
+      e.target.classList.add('o-hidden');
+    });
+  };
+
+  return fn;
+}
+
+/**
+ * Returns a function that adds an event handler to read an video file when user selects a file.
+ *
+ * @function
+ * @name addVideoListener
+ * @kind function
+ * @param {any} ): (obj
+ * @returns {void}
+ */
+function addVideoListener() {
+  const fn = (obj) => {
+    const fileReader = new FileReader();
+    const containerElement = document.getElementsByClassName(`.${obj.elId}`);
+
+    if (!containerElement) return;
+    const inputElement = document.querySelector(`.${obj.elId} .o-hidden-fileselector`);
+    const inputUrlElement = document.querySelector(`.${obj.elId} > input[type='url']`);
+    const videoElement = document.querySelector(`.${obj.elId} > video:first-of-type`);
+    const buttonElement = document.querySelector(`.${obj.elId} > input[type='button']`);
+
+    inputElement.addEventListener('change', (ev) => {
+      if (ev.target.files && ev.target.files[0]) {
+        videoElement.classList.remove('o-hidden');
+        buttonElement.classList.remove('o-hidden');
+        fileReader.onload = (e) => {
+          videoElement.src = e.target.result;
+          // eslint-disable-next-line no-param-reassign
+          obj.val = e.target.result;
+        };
+        fileReader.readAsDataURL(ev.target.files[0]);
+      }
+    });
+    inputUrlElement.addEventListener('input', () => {
+      videoElement.classList.remove('o-hidden');
+      buttonElement.classList.remove('o-hidden');
+      videoElement.src = inputUrlElement.value;
+      // eslint-disable-next-line no-param-reassign
+      obj.val = inputUrlElement.value;
+    });
+
+    // Find the remove button and attach event handler.
+    buttonElement.addEventListener('click', (e) => {
+      // Clear the filename
+      document.getElementById(obj.elId).value = '';
+      // Also clear the model value
+      // eslint-disable-next-line no-param-reassign
+      obj.val = '';
+      inputElement.value = '';
+      inputUrlElement.value = '';
+      videoElement.classList.add('o-hidden');
+      buttonElement.classList.add('o-hidden');
       e.target.classList.add('o-hidden');
     });
   };
@@ -1163,7 +1776,7 @@ function addBatchEditListener() {
  */
 function turnIntoSearchList(obj) {
   const el = document.getElementById(obj.elId);
-  return searchList(el, { list: obj.list, config: obj.config });
+  return searchList(el, { list: obj.list, config: obj.config }, { localizeFunc, viewer });
 }
 
 /**
@@ -1233,12 +1846,29 @@ function editAttributes(feat) {
             obj.elId = `input-${currentLayer}-${obj.name}-${slugify(obj.requiredVal)}`;
             obj.elDependencyId = `input-${currentLayer}-${constraintProps[1]}`;
           } else {
-            alert('Villkor verkar inte vara rätt formulerat. Villkor formuleras enligt principen change:attribute:value');
+            // This is a configuration error. No need to localize
+            alert('Bad constraint. Should be "change:attribute:value"');
           }
+        } else if (obj.type === 'checkboxgroup') {
+          if (obj.options && obj.options.length > 0 && obj.val) {
+            const separator = obj.separator ? obj.separator : ';';
+            obj.val = obj.val.split(separator);
+          }
+          obj.isVisible = true;
+          obj.elId = `input-${currentLayer}-${obj.name}`;
+          obj.addListener = addCheckboxListener();
         } else if (obj.type === 'image') {
           obj.isVisible = true;
           obj.elId = `input-${currentLayer}-${obj.name}`;
           obj.addListener = addImageListener();
+        } else if (obj.type === 'audio') {
+          obj.isVisible = true;
+          obj.elId = `input-${currentLayer}-${obj.name}`;
+          obj.addListener = addAudioListener();
+        } else if (obj.type === 'video') {
+          obj.isVisible = true;
+          obj.elId = `input-${currentLayer}-${obj.name}`;
+          obj.addListener = addVideoListener();
         } else {
           obj.isVisible = true;
           obj.elId = `input-${currentLayer}-${obj.name}`;
@@ -1259,14 +1889,14 @@ function editAttributes(feat) {
           // Hide the attribute that this checkbox is connected to so it won't be changed unless user checks the box first.
           obj.isVisible = false;
           // Inject the checkbox next to the attribute
-          obj.formElement = editForm(batchObj) + editForm(obj);
+          obj.formElement = editForm(batchObj, { localizeFunc }) + editForm(obj, { localizeFunc });
 
           // Defer adding click handler until element exists in DOM
           batchObj.addListener = addBatchEditListener();
 
           batchEditBoxes.push(batchObj);
         } else {
-          obj.formElement = editForm(obj);
+          obj.formElement = editForm(obj, { localizeFunc });
         }
         return obj;
       });
@@ -1285,9 +1915,9 @@ function editAttributes(feat) {
       attachmentsForm = `<div id="o-attach-form-${currentLayer}"></div>`;
     }
 
-    let form = `<div id="o-form">${formElement}${relatedTablesFormHTML}${attachmentsForm}<br><div class="o-form-save"><input id="o-save-button-${currentLayer}" type="button" value="OK" aria-label="OK"></input></div></div>`;
+    let form = `<div id="o-form">${formElement}${relatedTablesFormHTML}${attachmentsForm}<br><div class="o-form-save"><input id="o-save-button-${currentLayer}" type="button" value="${localizeFunc('okButton')}" class="o-editor-input" aria-label="${localizeFunc('okButton')}"></input></div></div>`;
     if (autoCreatedFeature) {
-      form = `<div id="o-form">${formElement}${relatedTablesFormHTML}${attachmentsForm}<br><div class="o-form-save"><input id="o-save-button-${currentLayer}" type="button" value="Spara" aria-label="Spara"></input><input id="o-abort-button-${currentLayer}" type="button" value="Ta bort" aria-label="Ta bort"></input></div></div>`;
+      form = `<div id="o-form">${formElement}${relatedTablesFormHTML}${attachmentsForm}<br><div class="o-form-save"><input id="o-save-button-${currentLayer}" type="button" value="${localizeFunc('saveButton')}" aria-label="${localizeFunc('saveButton')}"></input><input id="o-abort-button-${currentLayer}" type="button" value="${localizeFunc('removeButton')}" aria-label="${localizeFunc('removeButton')}"></input></div></div>`;
       autoCreatedFeature = false;
     }
 
@@ -1305,10 +1935,10 @@ function editAttributes(feat) {
     if (attachmentsForm) {
       const attachmentEl = document.getElementById(`o-attach-form-${currentLayer}`);
       if (editsStore.hasFeature('insert', feature, currentLayer)) {
-        attachmentEl.innerHTML = `<label>${layer.get('attachments').formTitle || 'Bilagor'}</label><p>Du måste spara innan du kan lägga till bilagor.</p>`;
+        attachmentEl.innerHTML = `<label>${layer.get('attachments').formTitle || localizeFunc('attachmentsTitle')}</label><p>${localizeFunc('attchmentsSaveFirst')}</p>`;
       } else {
         // Async fire and forget. Populates the form placeholder.
-        attachmentsform(layer, feature, attachmentEl);
+        attachmentsform(layer, feature, attachmentEl, { localizeFunc });
       }
     }
 
@@ -1319,9 +1949,9 @@ function editAttributes(feat) {
     if (relatedTablesFormHTML) {
       const formEl = document.getElementById(`o-relatedtables-form-${currentLayer}`);
       if (editsStore.hasFeature('insert', feature, currentLayer)) {
-        formEl.innerHTML = '<h3>Relaterade objekt</h3><p>Du måste spara innan du kan lägga till relaterade objekt.</p>';
+        formEl.innerHTML = localizeFunc('relatedTablesSaveFirst');
       } else {
-        relatedTablesForm(viewer, layer, feature, formEl);
+        relatedTablesForm(viewer, layer, feature, formEl, { localizeFunc });
       }
     }
 
@@ -1348,6 +1978,11 @@ function editAttributes(feat) {
   }
 }
 
+/**
+ * Handles toggling of editing tools based on the triggered event.
+ * Events can come flying from anywhere, but most likely editor toolbar or MapTools toolbar
+ * @param {Event} e - The triggered event containing tool details.
+ */
 function onToggleEdit(e) {
   const { detail: { tool } } = e;
   e.stopPropagation();
@@ -1368,11 +2003,23 @@ function onToggleEdit(e) {
     removeInteractions();
   } else if (tool === 'save') {
     saveFeatures();
+  } else if (tool === 'abortSession') {
+    abortSession();
+  } else if (tool === 'undo') {
+    undo();
+  } else if (tool === 'redo') {
+    redo();
   }
 }
 
+/**
+ * Handles changes in edit state based on the triggered event.
+ * @param {Event} e - The triggered event containing tool and active status details.
+ */
 function onChangeEdit(e) {
   const { detail: { tool, active } } = e;
+
+  // Cancel drawing if another tool becomes active
   if (tool !== 'draw' && active) {
     cancelDraw();
   }
@@ -1473,7 +2120,8 @@ async function createFeatureApi(layerName, geometry = null) {
   const newfeature = new Feature();
   if (geometry) {
     if (geometry.getType() !== editLayer.get('geometryType')) {
-      throw new Error('Kan inte lägga till en geometri av den typen i det lagret');
+      // This is a developer error, no need to localize
+      throw new Error('Bad geometry type');
     }
     newfeature.setGeometryName(editLayer.get('geometryName'));
     newfeature.setGeometry(geometry);
@@ -1497,9 +2145,133 @@ function setActiveLayerApi(layerName) {
   if (!layer || layer.get('isTable')) {
     // Can't set tables as active in editor as the editor can't handle them. They are in list though, as they may
     // be edited through api
-    throw new Error(`Layer ${layerName} är inte redigerbart`);
+    // This is a developer error, no need to localize
+    throw new Error(`Layer ${layerName} is not editable`);
   }
   setEditLayer(layerName);
+}
+
+/**
+ * Callback when split-line-by-point tool finishes drawing. Performs the actual splitting
+ * @param {any} evt a OL DrawEvent
+ */
+function onSplitLineByPointEnd(evt) {
+  // TODO: Need to verify?
+  const selectedFeature = select.getFeatures().item(0);
+  // Clear selection to avoid it being stuck selected
+  select.getFeatures().clear();
+  const line = selectedFeature.getGeometry();
+  const originalCoords = line.getCoordinates();
+  const cuttingCoord = evt.feature.getGeometry().getCoordinates();
+  let segmentNo = 0;
+  let part1Coords = [];
+  let part2Coords = [];
+  // TODO: remove empty if statement and inverse logic or toast
+  if (topology.coordIsEqual(cuttingCoord, line.getFirstCoordinate()) || topology.coordIsEqual(cuttingCoord, line.getLastCoordinate())) {
+    // Can only happen on actual first point as we would trigger on lastCoord on the semgment before this happens
+    // Nothing to do, can't cut on first or last
+    console.log('Första eller sista. Inget att dela');
+  } else {
+    // Find the segmen where to split
+    line.forEachSegment((startCoord, endCoord) => {
+      const currSegment = new LineString([startCoord, endCoord]);
+      const nearestPoint = currSegment.getClosestPoint(cuttingCoord);
+      // Round distance so we can determine if point is on line. It still is pretty small so
+      // snapping must be activated in order to have any chance at actually hitting a line.
+      const squaredD = toFixed(squaredDistance(cuttingCoord[0], cuttingCoord[1], nearestPoint[0], nearestPoint[1]), 10);
+      if (squaredD === 0) {
+        // Check if we hit an existing vertex, then split here, otherwise insert new point.
+        if (topology.coordIsEqual(cuttingCoord, currSegment.getLastCoordinate())) {
+          part1Coords = originalCoords.slice(0, segmentNo + 2);
+          part2Coords = originalCoords.slice(segmentNo + 1);
+        } else {
+          // Have to insert a new vertex where clicked
+          part1Coords = originalCoords.slice(0, segmentNo + 1);
+          part1Coords.push(cuttingCoord);
+          part2Coords = originalCoords.slice(segmentNo + 1);
+          part2Coords.unshift(cuttingCoord);
+        }
+        // Return from forEach. We found our point, no need to loop further.
+        return true;
+      }
+      segmentNo += 1;
+      // Consistent return for forEach , keep lopping until found.
+      return false;
+    });
+  }
+  if (part2Coords.length > 1) {
+    const layer = viewer.getLayer(currentLayer);
+    // Click actually hit the line, split where clicked.
+    // Start with the easy one, change geom of original line
+
+    // Add both edits as a transaction to undostack
+    const undoItems = [];
+    const before = selectedFeature.clone();
+    before.setId(selectedFeature.getId());
+    undoItems.push({
+      layer,
+      featureRef: selectedFeature,
+      op: 'update',
+      before
+    });
+    selectedFeature.getGeometry().setCoordinates(part1Coords);
+    saveFeature({
+      feature: selectedFeature,
+      layerName: currentLayer,
+      action: 'update',
+      before
+    });
+    // The litte tricker, create a copy with the rest of the line
+    const newFeature = selectedFeature.clone();
+    newFeature.setGeometry(new LineString(part2Coords));
+    newFeature.setId(createId(layer));
+    layer.getSource().addFeature(newFeature);
+    saveFeature({
+      feature: newFeature,
+      layerName: currentLayer,
+      action: 'insert'
+    });
+    undoItems.push({
+      layer,
+      featureRef: newFeature,
+      op: 'insert'
+    });
+    undoHandler.pushEdits(undoItems);
+    emitUndoStackEvent('edit');
+  }
+
+  // We're done, either the line is split or user clicked outside geometry.
+  // Reset editor state.
+  setActive();
+}
+
+/**
+ * Selects a modify too as the active interaction
+ * Only to be called when a feature has already been selected and user has pressed
+ * the corresponding tool button.
+ * @param {any} toolName Name of the tool
+ */
+function setModifyToolApi(toolName) {
+  // This function is a placeholder for future tools. It should switch out tool name and act accordingly
+  if (toolName === 'split-line-by-point') {
+    const selectedFeature = select.getFeatures().item(0);
+    // Create a new temporary draw interaction depending on toolName
+    // This can be removed in the handler as it is a part of the event.
+    const drawInterationProps = {
+      type: 'Point',
+      // Don't emit click events as it will activate select interaction when finished.
+      // The drawend handler will still be called.
+      stopClick: true
+    };
+    // Disable the handler's normal interactions while we're splitting and add or own
+    setActive('custom');
+    modifyDrawInteraction = new Draw(drawInterationProps);
+    modifyDrawInteraction.on('drawend', onSplitLineByPointEnd);
+    modifyDrawSnapInteraction = new Snap({ features: new Collection([selectedFeature]) });
+
+    map.addInteraction(modifyDrawInteraction);
+    map.addInteraction(modifyDrawSnapInteraction);
+  }
 }
 /**
  * Eventhandler called from relatedTableForm when delete button is pressed
@@ -1519,51 +2291,100 @@ function preselectFeature(feature) {
 }
 
 /**
- * Creates the handler. It is used as sort of a singelton, but in theory there could be many handlers.
- * It communicates with the editor toolbar and forms using DOM events, which makes it messy to have more than one instance as they would use the same events.
+ * Function to call when component becomes inactive.
+ * Great place to clean up stuff.
+ */
+function onDisable() {
+  if (clearUndoOnToolChange) {
+    clearUndoStack();
+  }
+}
+/**
+ * Creates the handler Component. In reality only one instance can be created as it relies on global variables and DOM ids and DOM events
+ * It isn't a traditional Component as it has no visual elements but it can emit Eventer events.
+ * It communicates with the editor toolbar and forms using DOM events.
  * @param {any} options
  * @param {any} v The viewer object
+ * @returns {any} a Component
  */
 export default function editHandler(options, v) {
-  viewer = v;
-  featureInfo = viewer.getControlByName('featureInfo');
-  if (options.featureList) {
-    infowindowCmp = Infowindow({ viewer, type: 'floating', title: 'Välj objekt' });
-    infowindowCmp.render();
-  }
-  map = viewer.getMap();
-  currentLayer = options.currentLayer;
-  editableLayers = options.editableLayers;
+  return Component({
+    onInit() {
+      component = this;
+      viewer = v;
+      map = viewer.getMap();
+      defaultSelectionStyle = getDefaultSelectStyleFunction();
+      undoHandler = new UndoStack({ maxLength: options.maxUndoLevels });
+      reuseIds = options.reuseIds;
+      localizeFunc = options.localizeFunc;
+      ({
+        clearUndoOnLayerChange,
+        clearUndoOnToolChange,
+        clearUndoOnSessionEnd
+      } = options);
 
-  // set edit properties for editable layers
-  editLayers = setEditProps(options);
-  editableLayers.forEach((layerName) => {
-    verifyLayer(layerName);
-    if (layerName === currentLayer && options.isActive) {
-      dispatcher.emitEnableInteraction();
-      setEditLayer(layerName);
-    }
-  });
+      // Set up a layer for displaying trace possibilities. Do it up front as it may become possible to turn it on later
+      traceHighligtLayer = new VectorLayer({
+        group: 'none',
+        source: new VectorSource(),
+        style: {
+          'stroke-color': 'rgba(100, 255, 0, 1)',
+          'stroke-width': 3
+        },
+        visible: true
+      });
+      if (options.traceStyle) {
+        const s = Style.createStyle({ style: options.traceStyle, viewer });
+        traceHighligtLayer.setStyle(s);
+      }
+      map.addLayer(traceHighligtLayer);
+      traceSource = new VectorSource();
+      useTrace = options.trace;
 
-  autoSave = options.autoSave;
-  autoForm = options.autoForm;
-  validateOnDraw = options.validateOnDraw;
+      featureInfo = viewer.getControlByName('featureInfo');
+      if (options.featureList) {
+        floatingPanelCmp = FloatingPanel({ viewer, type: 'floating', title: localizeFunc('selectFeature') });
+        floatingPanelCmp.render();
+      }
+      currentLayer = options.currentLayer;
+      editableLayers = options.editableLayers;
 
-  // Listen to DOM events from menus and forms
-  document.addEventListener('toggleEdit', onToggleEdit);
-  document.addEventListener('changeEdit', onChangeEdit);
-  document.addEventListener('editorShapes', onChangeShape);
-  document.addEventListener('customDrawEnd', onCustomDrawEnd);
-  document.addEventListener(dispatcher.EDIT_CHILD_EVENT, onEditChild);
-  document.addEventListener(dispatcher.ADD_CHILD_EVENT, onAddChild);
-  document.addEventListener(dispatcher.DELETE_CHILD_EVENT, onDeleteChild);
+      // set edit properties for editable layers
+      editLayers = setEditProps(options);
+      editableLayers.forEach((layerName) => {
+        verifyLayer(layerName);
+        if (layerName === currentLayer && options.isActive) {
+          dispatcher.emitEnableInteraction();
+          setEditLayer(layerName);
+        }
+      });
 
-  return {
+      autoSave = options.autoSave;
+      autoForm = options.autoForm;
+      validateOnDraw = options.validateOnDraw;
+      // We set tolerace as we can't read default from OL, but we can set it
+      // Cant' set 0, but that case you can disable snap
+      snapTolerance = options.snapTolerance || 10;
+
+      // Listen to DOM events from menus and forms
+      document.addEventListener('toggleEdit', onToggleEdit);
+      document.addEventListener('changeEdit', onChangeEdit);
+      document.addEventListener('editorShapes', onChangeShape);
+      document.addEventListener('customDrawEnd', onCustomDrawEnd);
+      document.addEventListener(dispatcher.EDIT_CHILD_EVENT, onEditChild);
+      document.addEventListener(dispatcher.ADD_CHILD_EVENT, onAddChild);
+      document.addEventListener(dispatcher.DELETE_CHILD_EVENT, onDeleteChild);
+    },
     // These functions are called from Editor Component, possibly from its Api so change these calls with caution.
     createFeature: createFeatureApi,
     editAttributesDialog: editAttributesDialogApi,
     deleteFeature: deleteFeatureApi,
     setActiveLayer: setActiveLayerApi,
-    preselectFeature
-  };
+    setModifyTool: setModifyToolApi,
+    preselectFeature,
+    undo,
+    redo,
+    abortSession,
+    onDisable
+  });
 }

@@ -7,6 +7,7 @@ import * as olLayer from 'ol/layer';
 import * as olSource from 'ol/source';
 import * as olStyle from 'ol/style';
 import * as olFormat from 'ol/format';
+import * as olProj from 'ol/proj';
 import * as ui from './src/ui';
 import Viewer from './src/viewer';
 import loadResources from './src/loadresources';
@@ -29,6 +30,9 @@ import 'drag-drop-touch';
 import permalink from './src/permalink/permalink';
 import * as Loader from './src/loading';
 import Spinner from './src/utils/spinner';
+import layerType from './src/layer/layertype';
+import mapUtils from './src/maputils';
+import registerServiceWorker from './src/utils/registerserviceworker';
 
 const Origo = function Origo(configPath, options = {}) {
   /** Reference to the returned Component */
@@ -50,6 +54,7 @@ const Origo = function Origo(configPath, options = {}) {
     },
     breakPointsPrefix: 'o-media',
     defaultControls: [
+      { name: 'localization' },
       { name: 'scaleline' },
       { name: 'zoom' },
       { name: 'rotate' },
@@ -65,20 +70,45 @@ const Origo = function Origo(configPath, options = {}) {
     return null;
   }
 
-  const initControls = (controlDefs) => {
-    const controls = [];
-    controlDefs.forEach((def) => {
-      if ('name' in def) {
-        const controlName = titleCase(def.name);
-        const controlOptions = def.options || {};
-        if (controlName in origoControls) {
-          const control = origoControls[controlName](controlOptions);
-          control.options = Object.assign(control.options || {}, controlOptions);
-          controls.push(control);
-        }
-      }
-    });
-    return controls;
+  const initControls = async (controlDefs) => {
+    const locControlDefs = controlDefs.shift(); // Localization is first of the defaultControls;
+
+    if (!(locControlDefs.options)) {
+      locControlDefs.options = {
+        localeId: 'sv-SE'
+      };
+    }
+
+    // a potential loc query param for Localization needs to be set
+    const localizationComponent = origoControls.Localization(locControlDefs.options);
+    localizationComponent.options = locControlDefs.options;
+
+    const searchParams = new URLSearchParams(window.location.search);
+    if (searchParams.has('loc')) {
+      const localization = searchParams.get('loc');
+      localizationComponent.setLocale(localization);
+    }
+
+    const restControls = await Promise.all(
+      controlDefs
+        .filter((def) => 'name' in def)
+        .map(async (def) => {
+          // support both built-in and user-supplied (which might be lazy-loaded) controls
+          const controlFactory = origoControls[titleCase(def.name)] ?? options.controls[def.name];
+          if (!controlFactory) {
+            throw new Error(`Unknown control '${def.name}'`);
+          }
+
+          const controlOptions = { ...def.options, localization: localizationComponent };
+          // controlFactory can be either a function to create a control (built-in and non-lazy loaded) or a function
+          // to create a Promise that loads the function that creates the control
+          const controlOrLazyLoadedFactory = await controlFactory(controlOptions);
+          const control = typeof controlOrLazyLoadedFactory === 'function' ? controlOrLazyLoadedFactory(controlOptions) : controlOrLazyLoadedFactory;
+          control.options = { ...control.options, ...controlOptions };
+          return control;
+        })
+    );
+    return [localizationComponent, ...restControls];
   };
 
   const initExtensions = (extensionDefs) => {
@@ -106,10 +136,13 @@ const Origo = function Origo(configPath, options = {}) {
   const initViewer = () => {
     const defaultConfig = Object.assign({}, origoConfig, options);
     loadResources(configPath, defaultConfig)
-      .then((data) => {
+      .then(async (data) => {
         const viewerOptions = data.options;
-        viewerOptions.controls = initControls(viewerOptions.controls);
+        viewerOptions.controls = await initControls(viewerOptions.controls);
         viewerOptions.extensions = initExtensions(viewerOptions.extensions || []);
+        return viewerOptions;
+      })
+      .then((viewerOptions) => {
         const target = viewerOptions.target;
         viewer = Viewer(target, viewerOptions);
         viewer.on('loaded', () => {
@@ -139,6 +172,16 @@ const Origo = function Origo(configPath, options = {}) {
       document.getElementsByTagName('head')[0].appendChild(base);
       origo = this;
       initViewer();
+
+      // Service worker config is not in index.json as it may come handy to have the filename exposed in
+      // index.html in order to trigger a new install if using a SW with queryparameters and all assets are cached.
+      // Defer until everything is in place so we can use localization and does not have to compete
+      // with downloads to get app starting.
+      if (options.serviceWorker) {
+        origo.on('load', (e) => {
+          registerServiceWorker(e, options.serviceWorker.url);
+        });
+      }
     }
   });
 };
@@ -163,6 +206,7 @@ Origo.ol.Feature = olFeature;
 Origo.ol.Collection = olCollection;
 Origo.ol.Overlay = olOverlay;
 Origo.ol.format = olFormat;
+Origo.ol.proj = olProj;
 Origo.Utils = Utils;
 Origo.dropdown = dropdown;
 Origo.renderSvgIcon = renderSvgIcon;
@@ -172,5 +216,7 @@ Origo.Loader.show = Loader.showLoading;
 Origo.Loader.hide = Loader.hideLoading;
 Origo.Loader.withLoading = Loader.withLoading;
 Origo.Loader.getInlineSpinner = Spinner;
+Origo.layerType = layerType;
+Origo.mapUtils = mapUtils;
 
 export default Origo;

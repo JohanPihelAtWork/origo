@@ -8,10 +8,20 @@ Origo core has a lot of dependencies by default which are available to use from 
 
 Smaller adjustment to the core might be necessary but should be avoided to make the plugin as standalone as possible. 
 
+A number of Origo developer seminars were held in the second half of 2024 and first half of 2025. The presentation on plugins can be found at **[Developing in Origo part 3 - plugins](https://docs.google.com/presentation/d/13e38b81OnGhhud2t4cDxux5vXzGZYFLO/edit?usp=sharing&ouid=116035513551791915749&rtpof=true&sd=true)**.
+
+Plugins with a graphical user interface showing text and numbers can avail of the localization control in the Origo core. This makes the plugin potentially global and makes the user experience consistent when the localization control's language menu is enabled. Details on this can be found in the **[API documentation](https://origo-map.github.io/origo-documentation/latest/#using-origo-api)**.
+
 ## Available plugins
 Below is a list of available plugins. More information about each plugin can be found in the plugin's own repository.
 
 Please not that some plugins are third-party plugins that are neither developed nor maintained by Origo.
+
+**[Castor plugin](https://github.com/SigtunaGIS/castor-plugin)**
+A plugin for Origo made to integrate with Castor.
+
+**[Coordinate finder plugin](https://github.com/kartomat/coordinate-finder-plugin)**
+A plugin that lets the user search for locations through inputting coordinates in your Origo Map instance.
 
 **[Dialogue](https://github.com/origo-map/dialogue-plugin)**
 A simple citizens' dialogue plugin for Origo.
@@ -19,11 +29,29 @@ A simple citizens' dialogue plugin for Origo.
 **[Draw](https://github.com/origo-map/draw-plugin)**
 A draw tool plugin for simple sketching.
 
+**[EDP Vision plugin](https://github.com/haninge-geodata/edp-vision-plugin)**
+A plugin to connect Origo-map with EDP Visions "Integrations API GIS-koppling (Kubb)"
+
 **[Elevation profile](https://github.com/origo-map/elevation-profile-plugin)**
 A plugin that shows an elevation profile for linestring features with z-dimension.
 
+**[Elevation profile](https://github.com/jokd/elevation-profile-plugin-v2)**
+Elevation profile plugin for Origo. Shows profiles for linestrings or polygons that has z-dimension or gets z values from service. Improved version of the above.
+
+**[Featureinfo template](https://github.com/Sundsvallskommun/origo-featureinfo-template-plugin)**
+Origo plugin for configurable infowindow templates. Allows you to register your own featureinfo templates - including code that is executed only when the template's HTML is in the DOM - without changing anything in Origo's core.
+
 **[Geouttag](https://github.com/Eskilstuna-kommun/Geouttag)**
 A plugin for geodata export (requires FME Server).
+
+**[Globe plugin](https://github.com/origo-map/globe-plugin)**
+A plugin for Origo map to enable CesiumJS globe using Ol-Cesium
+
+**[Help plugin](https://github.com/Sundsvallskommun/origo-help-plugin)**
+Adds a help to a Origo-map.
+
+**[Iframe plugin](https://github.com/Eskilstuna-kommun/ek-iframe-plugin)**
+Ger ett API för att styra delar av Origo inuti en <iframe>.
 
 **[Layermanager](https://github.com/origo-map/layermanager)**
 A layer manager plugin.
@@ -31,11 +59,20 @@ A layer manager plugin.
 **[LM search plugin](https://github.com/origo-map/lmsearch-plugin)**
 Search for Lantmäteriet Direct services via Origoserver API.
 
+**[Matomo plugin](https://github.com/Sundsvallskommun/origo-matomo-plugin)**
+Plugin for Origo that sends usage statistics to Matomo as events.
+
 **[Multiselect plugin](https://github.com/origo-map/multiselect-plugin)**
 Plugin to select features with different methods such as circle, polygon and buffer.
 
 **[OIDC plugin](https://github.com/SigtunaGIS/oidc-plugin)**
 A plugin for openid connect authorization with Origo.
+
+**[Print logo switcher plugin](https://github.com/kartomat/print-logo-switcher-plugin)**
+A plugin that allows you to change the print logo in your Origo map instance.
+
+**[Rita Detaljplan](https://github.com/ritaplan/rita-detaljplan-origomap)**
+Shows a municipality's detailed development plans (detaljplaner) from a PostGIS database as a map layer, with an information panel for plan data, documents and regulations with their motives. Uses GeoServer or QGIS Server. Works with maps in Web Mercator and SWEREF 99 TM. Developed together with the QGIS plugin Rita Detaljplan.
 
 **[Swiper plugin](https://github.com/SigtunaGIS/swiper-plugin)**
 A plugin to compare two different views.
