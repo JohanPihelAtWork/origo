@@ -137,8 +137,12 @@ jobs:
           # Bygg bundle.js + index.html (produktion)
           RUN NODE_ENV=production npm run build
           # DEBUG: visa var byggprodukterna hamnade
-          RUN find /app -maxdepth 3 -name "bundle.js" -o -maxdepth 3 -name "index.html" | head -20 \
-          && echo "--- rotkatalogen ---" \
+          # 🔍 DEBUG: Visa exakt var byggfiler hamnade
+          RUN echo "=== Söker efter bundle.js ===" \
+          && find /app -name "bundle.js" 2>/dev/null || true \
+          && echo "=== Söker efter index.html ===" \
+          && find /app -name "index.html" 2>/dev/null || true \
+          && echo "=== Rotkatalogens innehåll ===" \
           && ls -la /app
           # Samla byggprodukter i /out.
           # Shell-syntax här TillåTS (RUN körs av sh) till skillnad
